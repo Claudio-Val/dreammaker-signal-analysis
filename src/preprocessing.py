@@ -48,7 +48,7 @@ def remove_empty_comments(df, column_name):
     return df.reset_index(drop=True)
 
 
-def preprocess_dataframe(df, datalake_path):
+def preprocess_dataframe(df, output_path):
     """
     Ejecuta todo el pipeline de preprocesamiento:
     - Limpieza de textos (post y comentario)
@@ -62,7 +62,7 @@ def preprocess_dataframe(df, datalake_path):
     df = remove_empty_comments(df, "clean_post_message")
 
     # Guardado en Databricks
-    output_dir = Path(datalake_path)
+    output_dir = Path(output_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fecha_str = datetime.now().strftime("%Y-%m-%d")

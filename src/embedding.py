@@ -39,7 +39,7 @@ def get_embeddings_batch(texts, batch_size=32):
     return torch.cat(all_embeddings).numpy()
 
 
-def generar_embeddings(df, s3=None, output_path):
+def generar_embeddings(df, output_path, s3=None):
     """
     Genera embeddings para publicaciones y comentarios usando BETO.
     

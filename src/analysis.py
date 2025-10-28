@@ -80,7 +80,7 @@ def save_fig(fig, name_prefix, folder=None):
 # -------------------
 # Funciones de graficado
 # -------------------
-def plot_proporcion(df, images_path=None):
+def plot_proporcion(df, folder=None):
     """
     Grafica la proporción de comentarios políticos vs de interés
     por institución y guarda la figura.
@@ -110,10 +110,10 @@ def plot_proporcion(df, images_path=None):
         mpatches.Patch(facecolor='white', edgecolor='black', label='Producto materializado')
     ]
     ax.legend(handles=legend_elements, loc='best')
-    save_fig(fig, "proporcion_interes_vs_politica", folder=images_path)
+    save_fig(fig, "proporcion_interes_vs_politica", folder=folder)
     plt.close(fig)
 
-def plot_volumen(df, x_col="Comentario político emocional", y_col="Pregunta sobre el producto", log_scale=False, images_path=None):
+def plot_volumen(df, x_col="Comentario político emocional", y_col="Pregunta sobre el producto", log_scale=False, folder=None):
     """
     Grafica volumen de comentarios por post y clase.
     Permite escala logarítmica.
@@ -152,19 +152,19 @@ def plot_volumen(df, x_col="Comentario político emocional", y_col="Pregunta sob
     ax.legend(handles=legend_elements, loc='best')
 
     prefix = "volumen_log" if log_scale else "volumen"
-    save_fig(fig, prefix, folder=images_path)
+    save_fig(fig, prefix, folder=folder)
     plt.close(fig)
 
 # -------------------
 # Función de reporte estadístico
 # -------------------
-def generar_reporte_estadistico(df, filename=None, reports_path=None):
+def generar_reporte_estadistico(df, filename=None, folder=None):
     """
     Genera un CSV con estadísticas de posts por clase y tipo de comentario,
     y lo guarda en la carpeta especificada (default: '/dbfs/FileStore/dreammaker/output/reports').
     """
-    if reports_path is None:
-        reports_path = "/dbfs/FileStore/dreammaker/output/reports"
+    if folder is None:
+        folder = "/dbfs/FileStore/dreammaker/output/reports"
 
     clases = ['carabineros','ejercito','gdp','fach','pdi','marina_inf','post_producto_materializado']
     tipos_comentario = ['Crítica genuina','Elogio al producto','Otro','Comentario político emocional','Pregunta sobre el producto']
@@ -186,7 +186,7 @@ def generar_reporte_estadistico(df, filename=None, reports_path=None):
         fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"reporte_estadistico_{fecha}.csv"
 
-    folder_path = Path(reports_path)
+    folder_path = Path(folder)
     folder_path.mkdir(parents=True, exist_ok=True)
     path_local = folder_path / filename
     df_stats.to_csv(path_local, index=False)

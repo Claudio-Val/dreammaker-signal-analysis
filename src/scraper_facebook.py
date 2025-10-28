@@ -108,7 +108,7 @@ def obtener_datos_facebook(facebook_token: str, datalake_path: str):
     print(f"📊 {len(df)} registros extraídos desde la API de Facebook.")
 
     # === Guardado en el Databricks  ===
-    output_dir = Path(output_path)
+    output_dir = Path(datalake_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fecha_str = datetime.now().strftime("%Y-%m-%d")

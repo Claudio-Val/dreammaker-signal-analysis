@@ -1,7 +1,7 @@
 # pipeline.py
 from src.scraper_facebook import obtener_datos_facebook
 from src.preprocessing import preprocess_dataframe
-from src.embeddings import generar_embeddings
+from src.embedding import generar_embeddings
 from src.classification import predecir_clases
 from src.clustering import agrupar_post
 from src import analysis
@@ -49,6 +49,9 @@ def main():
     # 6. Columnas de clasificación y colores
     df_agrupados = analysis.crear_columnas_clasificacion(df_agrupados)
     df_agrupados = analysis.asignar_colores_y_bordes(df_agrupados)
+    
+    # ** Funciones posteriores (Generar gráficos y Reporte estadístico) no son necesarias. **
+    #    Es utilizados únicamente como información preliminar rápida antes de reportes en PowerBI.
 
     # 7. Generar gráficos
     analysis.plot_proporcion(df_agrupados, folder=IMAGES_PATH)

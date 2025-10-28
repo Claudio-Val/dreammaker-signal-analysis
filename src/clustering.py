@@ -6,7 +6,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 
-def agrupar_post(df, n_clusters=11, plot=True, output_path="/dbfs/FileStore/dreammaker/output/processed", images_path="/dbfs/FileStore/dreammaker/output/images"):
+def agrupar_post(df, n_clusters=11, plot=True, processed_path="/dbfs/FileStore/dreammaker/output/processed", images_path="/dbfs/FileStore/dreammaker/output/images"):
     """
     Agrupa los posts usando KMeans sobre los embeddings,
     calcula proporciones de comentarios por clase y guarda
@@ -69,7 +69,7 @@ def agrupar_post(df, n_clusters=11, plot=True, output_path="/dbfs/FileStore/drea
     plt.close()
 
     # --- Guardado de clusters ---
-    path_clust = Path(output_path)
+    path_clust = Path(processed_path)
     path_clust.mkdir(exist_ok=True, parents=True)
     archivo_clust = path_clust / f"Clustered_posts_{time_str}.parquet"
     df_agrupados.to_parquet(archivo_clust, index=False)

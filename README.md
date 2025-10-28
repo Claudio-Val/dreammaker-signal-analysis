@@ -58,6 +58,7 @@ DreamMaker/
 - .env          # Variables de entorno (ej. FACEBOOK_TOKEN)
 - requirements.txt  # Dependencias de Python
 - README.md
+- scraper_notebook.html #Breve Notebook demostrativo del funcionamiento del scraper.
 
 ## Instalación
 
