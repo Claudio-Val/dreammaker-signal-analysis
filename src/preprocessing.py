@@ -1,74 +1,132 @@
-import pandas as pd
+"""
+src/preprocessing.py
+====================
+Limpieza de texto y filtrado de comentarios vacíos.
+
+Comportamiento incremental
+--------------------------
+- Primera ejecución : crea el Silver CSV desde cero.
+- Ejecuciones siguientes: hace append al Silver CSV existente
+  con los comentarios nuevos ya filtrados y limpios.
+"""
+
+import os
 import re
 import unicodedata
-from pathlib import Path
-from datetime import datetime
 
-def clean_text(text, inchar=" "):
+import pandas as pd
+
+
+_SILVER_PATH = os.path.join("data", "silver")
+_SILVER_FILE = os.path.join(_SILVER_PATH, "facebook_comments_clean.csv")
+
+
+# ── Limpieza de texto ─────────────────────────────────────────────────────────
+def clean_text(text: str | None, inchar: str = " ") -> str | None:
     """
-    Realiza una limpieza básica de texto eliminando signos, tildes,
-    repeticiones de símbolos y unifica espacios.
+    Limpieza básica de texto:
+    - Elimina signos especiales
+    - Lowercase + strip
+    - Elimina tildes (NFD)
+    - Colapsa saltos de línea y espacios múltiples
+    - Colapsa múltiples '?' en uno solo
+
+    Retorna None si la entrada es None.
     """
-    signos = '()[]{}<>^*#@=+#¡!'
+    if text is None:
+        return None
+
+    signos = "()[]{}<>^*#@=+#¡!"
     for k in signos:
         text = text.replace(k, " ")
 
     text = text.lower().strip()
-    text = ''.join(
-        c for c in unicodedata.normalize('NFD', text)
-        if unicodedata.category(c) != 'Mn'
+    text = "".join(
+        c for c in unicodedata.normalize("NFD", text)
+        if unicodedata.category(c) != "Mn"
     )
-    text = re.sub(r'\?{2,}', '?', text)
-    text = text.replace(' ', inchar)
-    text = re.sub('%s+' % inchar, inchar, text)
+    text = text.replace("\n", " ")
+    text = re.sub(r"\?{2,}", "?", text)
+    text = text.replace(" ", inchar)
+    text = re.sub(f"{re.escape(inchar)}+", inchar, text)
+
     return text
 
 
-def clean_text_column(df, source_col, target_col):
+# ── Filtrado de vacíos ────────────────────────────────────────────────────────
+def filtrar_comentarios_vacios(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Aplica la limpieza profunda a una columna de texto (como comentarios o publicaciones)
-    y guarda el resultado en una nueva columna.
+    Elimina filas donde comment_message sea NaN o string vacío.
     """
-    df[target_col] = df[source_col].astype(str).str.replace(r"\n", " ", regex=True)
-    df[target_col] = df[target_col].apply(lambda x: clean_text(x, " "))
-    df[target_col] = df[target_col].str.strip()
-    return df
+    n_antes = len(df)
 
+    mask = (
+        df["comment_message"].notna()
+        & df["comment_message"].astype(str).str.strip().ne("")
+    )
+    df = df[mask].copy()
 
-def remove_empty_comments(df, column_name):
-    """
-    Elimina filas donde el campo especificado (por ejemplo 'comment_message')
-    esté vacío o contenga solo espacios.
-    """
-    print(f"Comentarios antes de eliminar filas vacías: {len(df)}")
-    original_len = len(df)
-    df = df[df[column_name].astype(str).str.strip().astype(bool)]
-    print(f"Comentarios eliminados: {original_len - len(df)}")
-    print(f"Quedaron {len(df)} comentarios luego de eliminar filas vacías")
+    n_eliminados = n_antes - len(df)
+    if n_eliminados > 0:
+        print(f"   Filas eliminadas (comentario vacío): {n_eliminados}")
+
     return df.reset_index(drop=True)
 
 
-def preprocess_dataframe(df, output_path):
+# ── Guardado incremental ──────────────────────────────────────────────────────
+def _guardar_silver(df: pd.DataFrame) -> None:
     """
-    Ejecuta todo el pipeline de preprocesamiento:
-    - Limpieza de textos (post y comentario)
-    - Eliminación de filas vacías
-    - Guarda los resultados en dreammaker/output/processed
+    Hace append al Silver CSV si existe, o lo crea si es la primera ejecución.
     """
-    df = clean_text_column(df, "comment_message", "clean_comment_message")
-    df["clean_comment_message"] = df["clean_comment_message"].astype(str)
-    df = clean_text_column(df, "post_message", "clean_post_message")
-    df = remove_empty_comments(df, "clean_comment_message")
-    df = remove_empty_comments(df, "clean_post_message")
+    os.makedirs(_SILVER_PATH, exist_ok=True)
 
-    # Guardado en Databricks
-    output_dir = Path(output_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(_SILVER_FILE):
+        df.to_csv(_SILVER_FILE, mode="a", header=False, index=False, encoding="utf-8")
+    else:
+        df.to_csv(_SILVER_FILE, index=False, encoding="utf-8")
 
-    fecha_str = datetime.now().strftime("%Y-%m-%d")
-    file_path = output_dir / f"datos_procesados_{fecha_str}.parquet"
-    df.to_parquet(file_path, index=False)
-    print(f"Datos preprocesados guardados en: {file_path}")
+
+# ── Función pública ───────────────────────────────────────────────────────────
+def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ejecuta el pipeline de preprocesamiento sobre comentarios nuevos:
+      1. Filtra filas con comment_message vacío
+      2. Aplica clean_text → clean_comment_message y clean_post_message
+      3. Hace append al Silver CSV (o lo crea en primera ejecución)
+
+    Parámetros
+    ----------
+    df : pd.DataFrame
+        Delta de comentarios nuevos proveniente de obtener_datos_facebook.
+        Si el df viene vacío, retorna inmediatamente sin hacer nada.
+
+    Retorna
+    -------
+    pd.DataFrame
+        Comentarios nuevos limpios. DataFrame vacío si no había novedades.
+    """
+    if df.empty:
+        print("   Sin datos nuevos para preprocesar.")
+        return df
+
+    n_entrada = len(df)
+
+    # Filtrar vacíos
+    df = filtrar_comentarios_vacios(df)
+
+    # Limpiar texto
+    _clean_col = lambda x: clean_text(str(x), " ")
+    df["clean_comment_message"] = df["comment_message"].apply(_clean_col)
+    df["clean_post_message"]    = df["post_message"].apply(_clean_col)
+
+    # Guardar
+    _guardar_silver(df)
+
+    es_primera = not os.path.exists(_SILVER_FILE) or n_entrada == len(df)
+
+    print(f"{'─'*45}")
+    print(f"  {len(df)} comentarios nuevos guardados en Silver.")
+    print(f"  Archivo: {_SILVER_FILE}")
+    print(f"{'─'*45}")
 
     return df
-
