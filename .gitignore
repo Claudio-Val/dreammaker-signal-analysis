@@ -1,70 +1,20 @@
-# ========================================
-# ARCHIVOS Y CARPETAS GENERALES
-# ========================================
+# =====================================
+# DreamMaker project
+# =====================================
 
-# Archivos temporales de sistema
+# Datos propietarios
+data/
+labeling/
+
+# Variables de entorno
+my_env.env
+
+# Resultados generados
+outputs/
+
+# Caché de Jupyter
+.ipynb_checkpoints/
+
+# Archivos del sistema
 .DS_Store
 Thumbs.db
-
-# Archivos de entorno
-.env
-*.env
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# ========================================
-# SALIDAS Y ARCHIVOS GENERADOS
-# ========================================
-
-# Directorios de salida
-dreammaker/output/
-dreammaker/output/**
-
-# Reportes generados
-dreammaker/output/reports/
-dreammaker/output/images/
-dreammaker/output/processed/
-
-# ========================================
-# DATOS Y TEMPORALES
-# ========================================
-
-# Datos crudos o privados
-dreammaker/data/
-dreammaker/data/**
-
-# Bases de datos locales
-*.db
-*.sqlite
-*.sqlite3
-
-# Archivos CSV, Parquet, Excel generados
-*.csv
-*.xlsx
-*.xls
-*.parquet
-
-# ========================================
-# ENTORNO DE DATABRICKS
-# ========================================
-
-# Carpetas del sistema DBFS
-dbfs/
-FileStore/
-
-# ========================================
-# MODELOS
-# ========================================
-
-# Mantendré los modelos, ya que pesan poco
-#   (NO ignorar dreammaker/models/*.pkl)
-
-# ========================================
-# ENTORNOS VIRTUALES
-# ========================================
-
-venv/
-.venv/
-env/
