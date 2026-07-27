@@ -9,11 +9,19 @@ labeling/
 # Variables de entorno
 my_env.env
 
+# Entorno virtual para Airflow
+.venv_airflow/
+
 # Resultados generados
 outputs/
 
 # Caché de Jupyter
 .ipynb_checkpoints/
+
+__pycache__/
+
+# Airflow home
+.airflow/
 
 # Archivos del sistema
 .DS_Store
