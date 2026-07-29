@@ -9,6 +9,11 @@ Comportamiento incremental
 - Primera ejecución : guarda todos los comentarios extraídos.
 - Ejecuciones siguientes: carga el CSV existente, detecta comment_id
   ya vistos y hace append únicamente con los comentarios nuevos.
+
+Compatibilidad
+--------------
+- Modo local    : obtener_datos_facebook(access_token, page_id) → pd.DataFrame
+- Modo Airflow  : task_scraping(**context)                      → str (path Bronze)
 """
 
 import os
@@ -32,14 +37,9 @@ def _clean(val):
 
 
 def _cargar_ids_existentes() -> set:
-    """
-    Carga los comment_id ya presentes en Bronze.
-    Retorna un set vacío si el archivo no existe (primera ejecución).
-    """
     if not os.path.exists(_BRONZE_FILE):
         print("Bronze no encontrado. Se realizará extracción completa.")
         return set()
-
     df_existente = pd.read_csv(_BRONZE_FILE, usecols=["comment_id"], dtype=str)
     ids = set(df_existente["comment_id"].dropna().unique())
     print(f"Bronze existente cargado: {len(ids)} comment_id registrados.")
@@ -47,46 +47,22 @@ def _cargar_ids_existentes() -> set:
 
 
 def _guardar_bronze(df_nuevos: pd.DataFrame) -> None:
-    """
-    Hace append al CSV Bronze si existe, o lo crea si es la primera ejecución.
-    """
     os.makedirs(_BRONZE_PATH, exist_ok=True)
-
     if os.path.exists(_BRONZE_FILE):
         df_nuevos.to_csv(_BRONZE_FILE, mode="a", header=False, index=False, encoding="utf-8")
     else:
         df_nuevos.to_csv(_BRONZE_FILE, index=False, encoding="utf-8")
 
 
-# ── Función pública ───────────────────────────────────────────────────────────
-def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
+def _extraer_y_persistir(access_token: str, page_id: str) -> str:
     """
-    Extrae posts y comentarios desde la Facebook Graph API.
-
-    Comportamiento incremental: solo retorna y persiste comentarios
-    cuyo comment_id no esté ya en Bronze. En la primera ejecución
-    persiste y retorna todo.
-
-    Parámetros
-    ----------
-    access_token : str
-        Token de acceso (variable de entorno FACEBOOK_TOKEN).
-    page_id : str
-        ID de la página de Facebook (variable de entorno PAGE_ID).
-
-    Retorna
-    -------
-    pd.DataFrame
-        Solo los registros nuevos. DataFrame vacío si no hay novedades.
+    Lógica central de extracción. Retorna el path del archivo Bronze.
+    Usada tanto en modo local como en modo Airflow.
     """
-    if not access_token:
-        raise ValueError("Token de acceso no encontrado. Revisa FACEBOOK_TOKEN en tu .env.")
-
     ids_existentes = _cargar_ids_existentes()
 
     print("\nExtrayendo datos desde Facebook...")
 
-    # ── Posts con paginación segura ───────────────────────────────────────────
     url = f"https://graph.facebook.com/v18.0/{page_id}/posts"
     params = {
         "fields": (
@@ -127,7 +103,6 @@ def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
 
     print(f"Posts extraídos desde la API: {len(all_posts)}")
 
-    # ── Comentarios con paginación segura y deduplicación ────────────────────
     all_comments_by_post: dict = {}
 
     for post in all_posts:
@@ -146,18 +121,15 @@ def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
 
             while next_url:
                 if next_url in visited_comment_urls:
-                    print(f"⚠️  URL de paginación repetida en post {post_id}, deteniendo loop.")
+                    print(f"⚠️  URL repetida en post {post_id}, deteniendo loop.")
                     break
                 visited_comment_urls.add(next_url)
-
                 resp = requests.get(next_url)
                 comment_data = resp.json()
-
                 for c in comment_data.get("data", []):
                     if c["id"] not in seen_ids:
                         seen_ids.add(c["id"])
                         comments.append(c)
-
                 next_url = comment_data.get("paging", {}).get("next")
 
         all_comments_by_post[post_id] = comments
@@ -165,16 +137,12 @@ def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
     total_api = sum(len(v) for v in all_comments_by_post.values())
     print(f"Comentarios únicos extraídos desde la API: {total_api}")
 
-    # ── Construcción del DataFrame ────────────────────────────────────────────
     rows = []
-
     for post in all_posts:
-        post_id      = post.get("id")
-        post_message = _clean(post.get("message"))
-        post_created = post.get("created_time")
-        post_reactions = (
-            post.get("reactions", {}).get("summary", {}).get("total_count", 0)
-        )
+        post_id        = post.get("id")
+        post_message   = _clean(post.get("message"))
+        post_created   = post.get("created_time")
+        post_reactions = post.get("reactions", {}).get("summary", {}).get("total_count", 0)
         attachments    = post.get("attachments", {}).get("data", [])
         post_image_url = attachments[0].get("url") if attachments else None
         comments       = all_comments_by_post.get(post_id, [])
@@ -211,7 +179,18 @@ def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
 
     df_api = pd.DataFrame(rows)
 
-    # ── Filtrar solo comentarios nuevos ───────────────────────────────────────
+    # Filtrar sin texto (stickers, GIFs, imágenes)
+    n_antes = len(df_api)
+    mask = (
+        df_api["comment_message"].notna()
+        & df_api["comment_message"].astype(str).str.strip().ne("")
+    )
+    df_api = df_api[mask].copy()
+    n_sin_texto = n_antes - len(df_api)
+    if n_sin_texto > 0:
+        print(f"   {n_sin_texto} comentarios sin texto descartados (stickers/GIFs).")
+
+    # Filtrar solo nuevos
     if ids_existentes:
         df_nuevos = df_api[
             ~df_api["comment_id"].astype(str).isin(ids_existentes)
@@ -222,16 +201,37 @@ def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
     n_nuevos = len(df_nuevos)
 
     if n_nuevos == 0:
-        print("\n✔ Sin comentarios nuevos. Bronze ya está al día.")
-        return df_nuevos
+        print("\n✔ Sin comentarios nuevos con texto. Bronze ya está al día.")
+    else:
+        _guardar_bronze(df_nuevos)
+        print(f"\n{'─'*45}")
+        print(f"  {n_nuevos} comentarios nuevos agregados a Bronze.")
+        print(f"  Total Bronze acumulado: {len(ids_existentes) + n_nuevos} registros.")
+        print(f"  Archivo: {_BRONZE_FILE}")
+        print(f"{'─'*45}")
 
-    # ── Guardar en Bronze ─────────────────────────────────────────────────────
-    _guardar_bronze(df_nuevos)
+    return _BRONZE_FILE
 
-    print(f"\n{'─'*45}")
-    print(f"  {n_nuevos} comentarios nuevos agregados a Bronze.")
-    print(f"  Total Bronze acumulado: {len(ids_existentes) + n_nuevos} registros.")
-    print(f"  Archivo: {_BRONZE_FILE}")
-    print(f"{'─'*45}")
 
-    return df_nuevos
+# ── Modo local ────────────────────────────────────────────────────────────────
+def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
+    """Extrae datos y retorna DataFrame con el delta. Uso: pipeline.py local."""
+    if not access_token:
+        raise ValueError("Token no encontrado. Revisa FACEBOOK_TOKEN en tu .env.")
+    _extraer_y_persistir(access_token, page_id)
+    if not os.path.exists(_BRONZE_FILE):
+        return pd.DataFrame()
+    return pd.read_csv(_BRONZE_FILE)
+
+
+# ── Modo Airflow ──────────────────────────────────────────────────────────────
+def task_scraping(**context) -> str:
+    """
+    Callable para PythonOperator de Airflow.
+    Lee credenciales desde Airflow Variables.
+    Retorna el path del Bronze para XCom.
+    """
+    from airflow.sdk import Variable
+    access_token = Variable.get("FACEBOOK_TOKEN")
+    page_id      = Variable.get("PAGE_ID")
+    return _extraer_y_persistir(access_token, page_id)
