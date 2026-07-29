@@ -4,7 +4,7 @@ Pipeline de análisis de lenguaje natural sobre comentarios de Facebook para **D
 
 El sistema extrae comentarios en español chileno desde la Facebook Graph API, los vectoriza con BETO (BERT en español), y los clasifica mediante un **clasificador jerárquico en dos capas** que detecta intenciones comerciales y sarcasmo condicionado. El resultado final es un dataset analítico a nivel publicación, enriquecido con métricas agregadas y variables temáticas, listo para consumo en herramientas de visualización como Power BI.
 
-> **Versionado:** esta rama (`main`) contiene la arquitectura jerárquica multilabel descrita en este README, que es la versión activa del proyecto. La versión inicial del clasificador (modelo multiclase de una sola etapa) se conserva en la rama [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver la sección [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de por qué se migró.
+> **Versionado:** esta rama (`feature/airflow-orchestration`) añade **orquestación con Apache Airflow** sobre la arquitectura de clasificación jerárquica descrita en este README. Cada módulo de `src/` mantiene doble compatibilidad: puede ejecutarse en modo local vía `pipeline.py` (para desarrollo, debugging o corridas puntuales) o ser orquestado por el DAG de Airflow (`dags/dreammaker_dag.py`), sin duplicar la lógica de negocio. La versión local sin orquestador se mantiene en [`main`](../../tree/main). El clasificador multiclase de una sola etapa (generación anterior a la arquitectura jerárquica) se conserva en [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de ese cambio anterior, y [Orquestación con Airflow](#orquestación-con-airflow) para el detalle de esta rama.
 
 ---
 
@@ -58,6 +58,20 @@ En cada ejecución, el pipeline detecta automáticamente qué comentarios son nu
 En la primera ejecución, procesa y persiste todo desde cero sin configuración adicional.
 
 La única excepción es el módulo de agregación (`aggregation.py`), que siempre recalcula sobre el **Gold completo acumulado**, no solo sobre el delta (ver detalle más abajo).
+
+### Doble modo de ejecución: local y Airflow
+
+Cada módulo de `src/` expone tres funciones con una responsabilidad clara:
+
+| Función | Uso | Firma |
+|---|---|---|
+| `_xxx_y_persistir(df)` | Lógica de negocio real (privada, compartida) | recibe/retorna datos, escribe a disco, retorna el `path` de salida |
+| Función pública "modo local" (ej. `generar_embeddings`, `predecir_labels`) | Llamada por `pipeline.py` | recibe un `DataFrame` en memoria (el delta ya calculado por la etapa anterior), retorna `DataFrame` |
+| `task_xxx(**context)` | Callable de `PythonOperator` en el DAG | sin `DataFrame` como input: lee su propia entrada desde el archivo de la capa anterior, calcula el delta comparando IDs contra su propia capa de salida, y retorna el `path` del archivo generado (para XCom) |
+
+Ambas interfaces (local y Airflow) llaman a la misma lógica interna (`_xxx_y_persistir`), así que el comportamiento —incluyendo el procesamiento incremental— es idéntico sin importar cómo se ejecute el pipeline. Esto permite seguir usando `pipeline.py` para pruebas rápidas o notebooks, mientras Airflow gestiona la ejecución productiva (schedule, reintentos, alertas, historial de corridas).
+
+> **¿Por qué las tasks de Airflow no reciben ni retornan DataFrames vía XCom?** XCom no está pensado para transportar objetos grandes como un `DataFrame` de miles de embeddings de 768 dimensiones — tiene límites de tamaño y agregaría overhead de serialización innecesario. En su lugar, cada task lee y escribe directamente en la capa Bronze/Silver/Gold correspondiente en disco, y solo pasa el `path` del archivo resultante por XCom. Esto además hace que cada task sea atómica, idempotente y reintentable de forma independiente: si una task falla y Airflow la reintenta, simplemente vuelve a leer el estado actual del disco y recalcula su propio delta, sin depender de que la ejecución anterior haya dejado algo en memoria.
 
 ---
 
@@ -204,11 +218,14 @@ dreammaker-signal-analysis/
 │
 ├── src/
 │   ├── __init__.py
-│   ├── scraper_facebook.py      # Extracción desde Facebook Graph API
-│   ├── preprocessing.py         # Limpieza de texto
-│   ├── embedding.py             # Vectorización con BETO
-│   ├── classification.py        # Clasificador jerárquico + reglas de negocio
-│   └── aggregation.py           # Métricas por publicación + suavizado bayesiano
+│   ├── scraper_facebook.py      # Extracción desde Facebook Graph API (modo local + task_scraping)
+│   ├── preprocessing.py         # Limpieza de texto (modo local + task_preprocessing)
+│   ├── embedding.py             # Vectorización con BETO (modo local + task_embeddings)
+│   ├── classification.py        # Clasificador jerárquico + reglas de negocio (modo local + task_clasificacion)
+│   └── aggregation.py           # Métricas por publicación + suavizado bayesiano (modo local + task_agregacion)
+│
+├── dags/
+│   └── dreammaker_dag.py        # DAG de Airflow: encadena las 5 etapas como PythonOperators
 │
 ├── models/
 │   ├── logistic_ovr_model.pkl       # Capa 1: modelo OvR entrenado
@@ -219,19 +236,22 @@ dreammaker-signal-analysis/
 ├── data/                         # Bronze / Silver / Gold (no incluida en el repo)
 ├── labeling/                     # Dataset de entrenamiento (no incluida en el repo)
 ├── outputs/                      # Resultados y exportaciones del análisis
+├── airflow/                      # AIRFLOW_HOME local: airflow.cfg, metadata db, logs (no incluida en el repo)
+├── .venv_airflow/                # Entorno virtual dedicado a Airflow (no incluida en el repo)
 ├── reports/
 │   └── DreamMaker_Commercial_Analysis_Report.pdf
 │
-├── pipeline.py                   # Orquestador principal
+├── pipeline.py                   # Orquestador principal — modo local
+├── start_airflow.sh              # Levanta Airflow standalone apuntando a este proyecto
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-├── my_env.env.example            # Plantilla de variables de entorno
+├── my_env.env.example            # Plantilla de variables de entorno (modo local)
 ├── 01_semantic_classification_pipeline.ipynb
 └── 02_commercial_signal_analysis.ipynb
 ```
 
-> **Nota:** Las carpetas `data/` y `labeling/` no se incluyen en el repositorio. `data/` se crea automáticamente al ejecutar el pipeline. `labeling/` contiene muestras reales de comentarios y publicaciones de la PYME utilizadas para entrenar los modelos de Capa 1 y Capa 2, por lo que se omite por confidencialidad de los datos del cliente. El notebook `01_semantic_classification_pipeline.ipynb` documenta la metodología de entrenamiento (features, arquitectura, thresholds, evaluación), pero no es 100% reproducible de punta a punta sin ese dataset.
+> **Nota:** Las carpetas `data/`, `labeling/`, `airflow/` y `.venv_airflow/` no se incluyen en el repositorio. `data/` se crea automáticamente al ejecutar el pipeline (local o vía Airflow). `labeling/` contiene muestras reales de comentarios y publicaciones de la PYME utilizadas para entrenar los modelos de Capa 1 y Capa 2, por lo que se omite por confidencialidad de los datos del cliente. `airflow/` es el `AIRFLOW_HOME` generado localmente (contiene `airflow.cfg`, la base de datos de metadata y logs) y `.venv_airflow/` es el entorno virtual donde se instala Apache Airflow; ambos se generan siguiendo los pasos de [Orquestación con Airflow](#orquestación-con-airflow). El notebook `01_semantic_classification_pipeline.ipynb` documenta la metodología de entrenamiento (features, arquitectura, thresholds, evaluación), pero no es 100% reproducible de punta a punta sin ese dataset.
 
 ---
 
@@ -273,13 +293,97 @@ PAGE_ID=your_facebook_page_id_here
 
 ---
 
+## Orquestación con Airflow
+
+Esta rama añade un **DAG de Apache Airflow** (`dags/dreammaker_dag.py`) que orquesta las mismas 5 etapas del pipeline como tasks independientes, en reemplazo de la ejecución secuencial de `pipeline.py` para uso productivo.
+
+```
+dreammaker_comments_pipeline (dag_id)
+
+scraping_bronze  →  preprocessing_silver_csv  →  embeddings_silver_parquet  →  clasificacion_gold  →  agregacion_gold_post_metrics
+```
+
+Cada task corresponde a un `PythonOperator` que ejecuta el `task_xxx(**context)` del módulo respectivo (ver [Doble modo de ejecución](#doble-modo-de-ejecución-local-y-airflow)):
+
+| Task | Callable | Lee | Escribe |
+|---|---|---|---|
+| `scraping_bronze` | `task_scraping` | Facebook Graph API | `data/bronze/facebook_comments_raw.csv` |
+| `preprocessing_silver_csv` | `task_preprocessing` | Bronze | `data/silver/facebook_comments_clean.csv` |
+| `embeddings_silver_parquet` | `task_embeddings` | Silver CSV | `data/silver/facebook_comments_embeddings.parquet` |
+| `clasificacion_gold` | `task_clasificacion` | Silver Parquet | `data/gold/facebook_comments_*.parquet` |
+| `agregacion_gold_post_metrics` | `task_agregacion` | Gold classified (completo) | `data/gold/facebook_post_metrics.parquet` |
+
+Configuración del DAG: `schedule = "0 6 * * *"` (diario a las 06:00), `catchup=False` (no ejecuta corridas históricas pendientes), `max_active_runs=1` (evita corridas paralelas sobre los mismos archivos) y `retries=2` con `retry_delay=5min` por task. La task de embeddings tiene un `execution_timeout` de 2 horas, ya que la inferencia con BETO sobre volúmenes grandes de comentarios nuevos puede ser lenta.
+
+### Configuración del entorno de Airflow
+
+1. **Entorno virtual dedicado.** Airflow se instala en un entorno virtual separado del resto del proyecto (`.venv_airflow/`), para aislar sus dependencias:
+
+   ```bash
+   python -m venv .venv_airflow
+   source .venv_airflow/bin/activate
+   pip install apache-airflow
+   pip install -r requirements.txt   # dependencias del pipeline (transformers, xgboost, etc.)
+   ```
+
+2. **Primer arranque.** El script `start_airflow.sh` (en la raíz del proyecto) fija `AIRFLOW_HOME` dentro del propio proyecto y agrega la raíz del proyecto al `PYTHONPATH` (necesario para que los `PythonOperator` puedan hacer `from src... import ...`):
+
+   ```bash
+   #!/bin/bash
+   PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+   source "$PROJECT_DIR/.venv_airflow/bin/activate"
+   export AIRFLOW_HOME="$PROJECT_DIR/airflow"
+   export PYTHONPATH="$PROJECT_DIR"
+   airflow standalone
+   ```
+
+   La primera vez que se ejecuta (`./start_airflow.sh`), Airflow genera automáticamente `airflow/airflow.cfg` y la base de datos de metadata dentro de `airflow/` (carpeta ignorada por git — ver `.gitignore`).
+
+3. **Apuntar `dags_folder` a la carpeta del proyecto.** Por defecto, Airflow espera los DAGs dentro de `$AIRFLOW_HOME/dags` (es decir, `airflow/dags/`), pero esa carpeta está fuera del control de versiones porque `airflow/` completo está en `.gitignore`. Como este proyecto versiona sus DAGs en `dags/` (junto a `pipeline.py`, `src/`, etc.), es necesario redirigir `dags_folder` hacia esa ruta. Tras el primer arranque, detén Airflow (`Ctrl+C`) y edita `airflow/airflow.cfg`:
+
+   ```ini
+   [core]
+   dags_folder = /ruta/absoluta/a/dreammaker-signal-analysis/dags
+   ```
+
+   Alternativamente, sin tocar el `.cfg`, se puede fijar vía variable de entorno (por ejemplo, agregando la línea antes del `airflow standalone` en `start_airflow.sh`):
+
+   ```bash
+   export AIRFLOW__CORE__DAGS_FOLDER="$PROJECT_DIR/dags"
+   ```
+
+   Cualquiera de las dos opciones logra lo mismo: que Airflow lea el DAG desde la carpeta versionada en git en lugar de la carpeta `dags/` por defecto dentro de `AIRFLOW_HOME`.
+
+4. **Credenciales vía Airflow Variables.** En modo orquestado, `task_scraping` ya no lee `my_env.env`: obtiene las credenciales desde **Airflow Variables** (`airflow.sdk.Variable.get(...)`). Deben configurarse una vez, vía UI (`Admin → Variables`) o CLI:
+
+   ```bash
+   airflow variables set FACEBOOK_TOKEN "tu_token_de_acceso"
+   airflow variables set PAGE_ID "tu_page_id"
+   ```
+
+   > `my_env.env` sigue siendo necesario si además se quiere seguir corriendo `python pipeline.py` en modo local (ver [Configuración](#configuración)) — ambos mecanismos de credenciales conviven porque cada módulo mantiene su doble interfaz.
+
+### Ejecutar el pipeline orquestado
+
+```bash
+./start_airflow.sh
+```
+
+Esto levanta Airflow en modo `standalone` (scheduler + webserver + base de datos SQLite de metadata) en `http://localhost:8080`, con las credenciales de acceso a la UI impresas en consola en el primer arranque. El DAG `dreammaker_comments_pipeline` aparece en la UI y puede activarse (schedule diario) o dispararse manualmente:
+
+```bash
+airflow dags trigger dreammaker_comments_pipeline
+```
+
+---
+
 ## Uso
 
 ```bash
 python pipeline.py
 ```
 
-El pipeline detecta automáticamente si es la primera ejecución o si hay comentarios nuevos desde la última vez que se corrió.
+El pipeline detecta automáticamente si es la primera ejecución o si hay comentarios nuevos desde la última vez que se corrió. Esta forma de ejecución (modo local, sin Airflow) sigue siendo válida en esta rama para pruebas rápidas o debugging — ver [Orquestación con Airflow](#orquestación-con-airflow) para el modo de ejecución productivo.
 
 **Salida esperada:**
 
@@ -318,6 +422,7 @@ El pipeline detecta automáticamente si es la primera ejecución o si hay coment
 | `python-dotenv` | Carga de variables de entorno |
 | `joblib` | Serialización de modelos |
 | `tqdm` | Barras de progreso en generación de embeddings |
+| `apache-airflow` | Orquestación del pipeline (schedule, reintentos, monitoreo) — instalado en `.venv_airflow/`, entorno separado |
 
 ---
 
@@ -363,7 +468,7 @@ La versión inicial del proyecto (conservada en la rama [`legacy/v1`](../../tree
 
 **La solución:** migrar a la arquitectura jerárquica multilabel descrita en la sección [Clasificación jerárquica](#4-clasificación-jerárquica--gold-comentarios) de este README: una Capa 1 que predice 8 etiquetas no excluyentes de forma independiente, y una Capa 2 que usa esas predicciones como contexto para detectar sarcasmo — permitiendo que un comentario sea, por ejemplo, simultáneamente `interes=1` y `conflictivo=1`, en vez de forzarlo a una sola categoría.
 
-La rama `legacy/v1` se mantiene por trazabilidad histórica del proyecto, pero no recibe mantenimiento; toda mejora activa ocurre sobre `main`.
+La rama `legacy/v1` se mantiene por trazabilidad histórica del proyecto, pero no recibe mantenimiento; el desarrollo activo ocurre sobre `main` y sus ramas de feature, como `feature/airflow-orchestration`.
 
 ---
 

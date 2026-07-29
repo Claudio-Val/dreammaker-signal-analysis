@@ -21,7 +21,7 @@ outputs/
 __pycache__/
 
 # Airflow home
-.airflow/
+airflow/
 
 # Archivos del sistema
 .DS_Store
