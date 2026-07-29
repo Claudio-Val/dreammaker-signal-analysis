@@ -4,7 +4,9 @@ Pipeline de análisis de lenguaje natural sobre comentarios de Facebook para **D
 
 El sistema extrae comentarios en español chileno desde la Facebook Graph API, los vectoriza con BETO (BERT en español), y los clasifica mediante un **clasificador jerárquico en dos capas** que detecta intenciones comerciales y sarcasmo condicionado. El resultado final es un dataset analítico a nivel publicación, enriquecido con métricas agregadas y variables temáticas, listo para consumo en herramientas de visualización como Power BI.
 
-> **Versionado:** esta rama (`main`) contiene la arquitectura jerárquica multilabel descrita en este README, que es la versión activa del proyecto. La versión inicial del clasificador (modelo multiclase de una sola etapa) se conserva en la rama [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver la sección [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de por qué se migró.
+> **Versionado:** esta rama (`main`) contiene la arquitectura jerárquica multilabel descrita en este README, que corresponde a la versión estable del proyecto. La versión inicial del clasificador (modelo multiclase de una sola etapa) se conserva en la rama [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver la sección [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de esta migración.
+
+> La rama [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) contiene la evolución del proyecto hacia una arquitectura MLOps, incorporando Apache Airflow para la orquestación del pipeline mediante DAGs, ejecución modular de tareas y compatibilidad entre ejecución local (`pipeline.py`) y ejecución orquestada.
 
 ---
 
