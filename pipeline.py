@@ -8,44 +8,29 @@ Implementa una arquitectura Medallion (Bronze → Silver → Gold) y un
 clasificador jerárquico en dos capas para detección multilabel de
 intenciones y sarcasmo condicionado en comentarios en español chileno.
 
+Almacenamiento
+--------------
+    Bronze  → Cloud Storage  (CSV crudo)
+    Silver  → BigQuery       (dataset dreammaker_silver)
+    Gold    → BigQuery       (dataset dreammaker_gold)
+
+Ver src/config.py para los identificadores de proyecto/bucket/datasets,
+y el README para el detalle de la migración desde almacenamiento local.
+
 Comportamiento incremental
 --------------------------
 En cada ejecución el pipeline detecta automáticamente qué comentarios
-son nuevos respecto al estado anterior y procesa únicamente esos,
-haciendo append en cada capa. Si es la primera ejecución, procesa
-y persiste todo desde cero.
+son nuevos respecto al estado anterior (comparando IDs contra la capa
+siguiente en GCS/BigQuery) y procesa únicamente esos. Si es la primera
+ejecución, procesa y persiste todo desde cero.
 
 Etapas
 ------
-1. Scraping        : extrae desde Facebook Graph API             → Bronze
-2. Preprocesamiento: limpieza de texto, filtrado de vacíos       → Silver (CSV)
-3. Embeddings      : vectorización con BETO (768-dim)            → Silver (Parquet)
-4. Clasificación   : pipeline jerárquico OvR + XGBoost           → Gold (comentarios)
-5. Agregación      : métricas por post con suavizado bayesiano   → Gold (posts)
-
-Arquitectura del clasificador
------------------------------
-    Capa 1 — Regresión Logística OvR (multilabel)
-              Etiquetas: interes, elogio_producto, critica_producto,
-                         fanatismo_emocional, conflictivo, otro,
-                         solicitud, cuidado
-              Thresholds optimizados por etiqueta.
-
-    Capa 2 — XGBoost (binario)
-              Etiqueta : sarcasmo
-              Input    : embedding comentario + predicciones Capa 1
-
-    Reglas de negocio:
-              solicitud_real, interes_real, elogio_real,
-              critica_genuina, polarizacion_politica,
-              fanatismo, fanatismo_no_comercial
-
-Salidas en Gold
----------------
-    facebook_comments_classified.parquet    predicciones binarias por comentario
-    facebook_comments_probabilities.parquet probabilidades por comentario
-    facebook_comments_gold_enriched.parquet reglas de negocio por comentario
-    facebook_post_metrics.parquet           métricas agregadas por publicación
+1. Scraping        : extrae desde Facebook Graph API             → Bronze (GCS)
+2. Preprocesamiento: limpieza de texto, filtrado de vacíos       → Silver (BigQuery)
+3. Embeddings      : vectorización con BETO (768-dim)            → Silver (BigQuery)
+4. Clasificación   : pipeline jerárquico OvR + XGBoost           → Gold (BigQuery)
+5. Agregación      : métricas por post con suavizado bayesiano   → Gold (BigQuery)
 
 Uso
 ---
@@ -56,12 +41,14 @@ Requisitos
     Archivo my_env.env con:
         FACEBOOK_TOKEN=<token>
         PAGE_ID=<page_id>
+        GOOGLE_APPLICATION_CREDENTIALS=<ruta al JSON de la cuenta de servicio>
 
-    Modelos entrenados en models/:
+    Modelos entrenados, subidos a gs://<BUCKET_NAME>/models/:
         logistic_ovr_model.pkl
         logistic_ovr_thresholds.pkl
         xgb_sarcasm_model.pkl
         xgb_sarcasm_threshold.pkl
+    (se descargan automáticamente a ./models/ la primera vez que se usan)
 """
 
 import os
@@ -99,8 +86,13 @@ PAGE_ID      = os.getenv("PAGE_ID")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _crear_estructura_directorios(base_path: str) -> None:
-    """Crea la estructura Medallion de carpetas si no existe."""
-    for subdir in ["data/bronze", "data/silver", "data/gold", "models", "outputs"]:
+    """
+    Crea las carpetas locales todavía necesarias: modelos descargados
+    desde GCS y outputs de análisis exploratorio. Bronze/Silver/Gold ya
+    no viven en disco local (ver GCS/BigQuery en src/config.py), así que
+    no se crean data/bronze, data/silver ni data/gold.
+    """
+    for subdir in ["models", "outputs"]:
         os.makedirs(os.path.join(base_path, subdir), exist_ok=True)
 
 
@@ -109,10 +101,11 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Ejecuta el pipeline incremental completo de extremo a extremo.
 
-    Detecta automáticamente los comentarios nuevos en cada etapa
-    y procesa únicamente esos, haciendo append en Bronze, Silver y Gold.
-    Las métricas por post (paso 5) siempre se recalculan sobre el Gold
-    completo acumulado para mantener el prior bayesiano consistente.
+    Detecta automáticamente los comentarios nuevos en cada etapa y
+    procesa únicamente esos, haciendo append en Bronze (GCS) y en
+    Silver/Gold (BigQuery). Las métricas por post (paso 5) siempre se
+    recalculan sobre el Gold completo acumulado para mantener el prior
+    bayesiano consistente.
 
     Retorna
     -------
@@ -124,10 +117,7 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     _crear_estructura_directorios(os.getcwd())
 
     # ──────────────────────────────────────────────────────────────────
-    # 1. SCRAPING  →  Bronze
-    #    Extrae desde la API y retorna solo los comment_id nuevos
-    #    con texto válido (excluye stickers, GIFs e imágenes).
-    #    Si Bronze no existe, retorna todo. Si ya está al día, df vacío.
+    # 1. SCRAPING  →  Bronze (GCS)
     # ──────────────────────────────────────────────────────────────────
     print("\n[1/5] Extrayendo comentarios nuevos desde Facebook...")
     df = obtener_datos_facebook(
@@ -136,30 +126,25 @@ def main() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
 
     # ──────────────────────────────────────────────────────────────────
-    # 2. PREPROCESAMIENTO  →  Silver CSV
-    #    Limpia solo el delta recibido y hace append al Silver CSV.
+    # 2. PREPROCESAMIENTO  →  Silver (BigQuery)
     # ──────────────────────────────────────────────────────────────────
     print("\n[2/5] Preprocesando comentarios nuevos...")
     df = preprocess_dataframe(df)
 
     # ──────────────────────────────────────────────────────────────────
-    # 3. EMBEDDINGS  →  Silver Parquet
-    #    Genera embeddings BETO solo para el delta y hace append.
+    # 3. EMBEDDINGS  →  Silver (BigQuery)
     # ──────────────────────────────────────────────────────────────────
     print("\n[3/5] Generando embeddings BETO...")
     df = generar_embeddings(df)
 
     # ──────────────────────────────────────────────────────────────────
-    # 4. CLASIFICACIÓN JERÁRQUICA + REGLAS DE NEGOCIO  →  Gold
-    #    Clasifica solo el delta y hace append a los tres Parquet Gold.
+    # 4. CLASIFICACIÓN JERÁRQUICA + REGLAS DE NEGOCIO  →  Gold (BigQuery)
     # ──────────────────────────────────────────────────────────────────
     print("\n[4/5] Clasificando comentarios nuevos (pipeline jerárquico)...")
     df_gold, df_probas, df_gold_enriched = predecir_labels(df)
 
     # ──────────────────────────────────────────────────────────────────
-    # 5. AGREGACIÓN POR POST  →  Gold (métricas)
-    #    Siempre opera sobre el Gold completo acumulado para que el
-    #    prior bayesiano sea consistente con todos los datos disponibles.
+    # 5. AGREGACIÓN POR POST  →  Gold (BigQuery)
     # ──────────────────────────────────────────────────────────────────
     print("\n[5/5] Calculando métricas por publicación...")
     df_post_metrics = generar_metricas_post(df_gold_enriched)

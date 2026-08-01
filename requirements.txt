@@ -24,3 +24,8 @@ tqdm==4.66.5
 
 jupyter
 notebook
+
+google-cloud-storage
+google-cloud-bigquery
+db-dtypes
+pandas-gbq

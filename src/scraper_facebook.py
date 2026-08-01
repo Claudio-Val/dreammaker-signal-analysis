@@ -1,32 +1,36 @@
 """
 src/scraper_facebook.py
 =======================
-Extrae posts y comentarios desde la Facebook Graph API y los guarda
-en la capa Bronze (data/bronze/facebook_comments_raw.csv).
+Extrae posts y comentarios desde la Facebook Graph API y los guarda en
+la capa Bronze, en Cloud Storage (gs://<BUCKET_NAME>/bronze/...).
 
 Comportamiento incremental
 --------------------------
-- Primera ejecución : guarda todos los comentarios extraídos.
-- Ejecuciones siguientes: carga el CSV existente, detecta comment_id
-  ya vistos y hace append únicamente con los comentarios nuevos.
+- Primera ejecución : sube todos los comentarios extraídos.
+- Ejecuciones siguientes: descarga el CSV existente desde GCS, detecta
+  comment_id ya vistos y sube el archivo completo (existente + nuevos) —
+  ver nota sobre inmutabilidad de blobs en gcp_io.escribir_csv_gcs.
 
 Compatibilidad
 --------------
-- Modo local    : obtener_datos_facebook(access_token, page_id) → pd.DataFrame
-- Modo Airflow  : task_scraping(**context)                      → str (path Bronze)
-"""
+- Modo local   : obtener_datos_facebook(access_token, page_id) → pd.DataFrame (solo delta)
+- Modo Airflow : task_scraping(**context) → str (blob path en GCS)
 
-import os
+Credenciales de Facebook
+-------------------------
+- Modo local  : FACEBOOK_TOKEN / PAGE_ID leídos desde my_env.env (ver pipeline.py)
+- Modo Airflow: FACEBOOK_TOKEN / PAGE_ID leídos desde Airflow Variables
+"""
 
 import pandas as pd
 import requests
 
+from src import config
+from src.gcp_io import escribir_csv_gcs, ids_existentes_gcs
+
 
 # ── Valores que CSV/pandas interpreta como NaN ────────────────────────────────
 _NA_VALUES = {"NA", "N/A", "NULL", "null", "None", "nan", "NaN", ""}
-
-_BRONZE_PATH = os.path.join("data", "bronze")
-_BRONZE_FILE = os.path.join(_BRONZE_PATH, "facebook_comments_raw.csv")
 
 
 def _clean(val):
@@ -36,30 +40,13 @@ def _clean(val):
     return None if str(val).strip() in _NA_VALUES else val
 
 
-def _cargar_ids_existentes() -> set:
-    if not os.path.exists(_BRONZE_FILE):
-        print("Bronze no encontrado. Se realizará extracción completa.")
-        return set()
-    df_existente = pd.read_csv(_BRONZE_FILE, usecols=["comment_id"], dtype=str)
-    ids = set(df_existente["comment_id"].dropna().unique())
-    print(f"Bronze existente cargado: {len(ids)} comment_id registrados.")
-    return ids
-
-
-def _guardar_bronze(df_nuevos: pd.DataFrame) -> None:
-    os.makedirs(_BRONZE_PATH, exist_ok=True)
-    if os.path.exists(_BRONZE_FILE):
-        df_nuevos.to_csv(_BRONZE_FILE, mode="a", header=False, index=False, encoding="utf-8")
-    else:
-        df_nuevos.to_csv(_BRONZE_FILE, index=False, encoding="utf-8")
-
-
-def _extraer_y_persistir(access_token: str, page_id: str) -> str:
+def _extraer_y_persistir(access_token: str, page_id: str) -> tuple[str, pd.DataFrame]:
     """
-    Lógica central de extracción. Retorna el path del archivo Bronze.
+    Lógica central de extracción. Retorna (blob_path, df_nuevos).
     Usada tanto en modo local como en modo Airflow.
     """
-    ids_existentes = _cargar_ids_existentes()
+    ids_existentes = ids_existentes_gcs(config.GCS_BRONZE_BLOB, "comment_id")
+    print(f"Bronze existente en GCS: {len(ids_existentes)} comment_id registrados.")
 
     print("\nExtrayendo datos desde Facebook...")
 
@@ -89,8 +76,7 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
 
         if "error" in data:
             raise Exception(
-                f"Facebook API Error {data['error']['code']}: "
-                f"{data['error']['message']}"
+                f"Facebook API Error {data['error']['code']}: {data['error']['message']}"
             )
 
         for post in data.get("data", []):
@@ -103,6 +89,7 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
 
     print(f"Posts extraídos desde la API: {len(all_posts)}")
 
+    # ── Comentarios con paginación segura y deduplicación ────────────────────
     all_comments_by_post: dict = {}
 
     for post in all_posts:
@@ -124,12 +111,15 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
                     print(f"⚠️  URL repetida en post {post_id}, deteniendo loop.")
                     break
                 visited_comment_urls.add(next_url)
+
                 resp = requests.get(next_url)
                 comment_data = resp.json()
+
                 for c in comment_data.get("data", []):
                     if c["id"] not in seen_ids:
                         seen_ids.add(c["id"])
                         comments.append(c)
+
                 next_url = comment_data.get("paging", {}).get("next")
 
         all_comments_by_post[post_id] = comments
@@ -137,7 +127,9 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
     total_api = sum(len(v) for v in all_comments_by_post.values())
     print(f"Comentarios únicos extraídos desde la API: {total_api}")
 
+    # ── Construcción del DataFrame ────────────────────────────────────────────
     rows = []
+
     for post in all_posts:
         post_id        = post.get("id")
         post_message   = _clean(post.get("message"))
@@ -159,9 +151,7 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
                     "comment_message":   _clean(comment.get("message")),
                     "comment_created":   comment.get("created_time"),
                     "comment_reactions": (
-                        comment.get("reactions", {})
-                               .get("summary", {})
-                               .get("total_count", 0)
+                        comment.get("reactions", {}).get("summary", {}).get("total_count", 0)
                     ),
                 })
         else:
@@ -192,9 +182,7 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
 
     # Filtrar solo nuevos
     if ids_existentes:
-        df_nuevos = df_api[
-            ~df_api["comment_id"].astype(str).isin(ids_existentes)
-        ].copy()
+        df_nuevos = df_api[~df_api["comment_id"].astype(str).isin(ids_existentes)].copy()
     else:
         df_nuevos = df_api.copy()
 
@@ -203,25 +191,30 @@ def _extraer_y_persistir(access_token: str, page_id: str) -> str:
     if n_nuevos == 0:
         print("\n✔ Sin comentarios nuevos con texto. Bronze ya está al día.")
     else:
-        _guardar_bronze(df_nuevos)
+        escribir_csv_gcs(df_nuevos, config.GCS_BRONZE_BLOB, append=True)
         print(f"\n{'─'*45}")
-        print(f"  {n_nuevos} comentarios nuevos agregados a Bronze.")
+        print(f"  {n_nuevos} comentarios nuevos subidos a Bronze (GCS).")
         print(f"  Total Bronze acumulado: {len(ids_existentes) + n_nuevos} registros.")
-        print(f"  Archivo: {_BRONZE_FILE}")
+        print(f"  gs://{config.BUCKET_NAME}/{config.GCS_BRONZE_BLOB}")
         print(f"{'─'*45}")
 
-    return _BRONZE_FILE
+    return config.GCS_BRONZE_BLOB, df_nuevos
 
 
 # ── Modo local ────────────────────────────────────────────────────────────────
 def obtener_datos_facebook(access_token: str, page_id: str) -> pd.DataFrame:
-    """Extrae datos y retorna DataFrame con el delta. Uso: pipeline.py local."""
+    """
+    Extrae datos y retorna SOLO el delta de comentarios nuevos. Uso: pipeline.py local.
+
+    (Antes esta función retornaba el Bronze completo leído desde disco,
+    lo que hacía que preprocessing/embedding/classification reprocesaran
+    todo en cada corrida. Se corrige para que, igual que en modo Airflow,
+    solo se propague el delta real hacia la siguiente etapa.)
+    """
     if not access_token:
         raise ValueError("Token no encontrado. Revisa FACEBOOK_TOKEN en tu .env.")
-    _extraer_y_persistir(access_token, page_id)
-    if not os.path.exists(_BRONZE_FILE):
-        return pd.DataFrame()
-    return pd.read_csv(_BRONZE_FILE)
+    _, df_nuevos = _extraer_y_persistir(access_token, page_id)
+    return df_nuevos
 
 
 # ── Modo Airflow ──────────────────────────────────────────────────────────────
@@ -229,9 +222,10 @@ def task_scraping(**context) -> str:
     """
     Callable para PythonOperator de Airflow.
     Lee credenciales desde Airflow Variables.
-    Retorna el path del Bronze para XCom.
+    Retorna el blob path de Bronze en GCS para XCom.
     """
     from airflow.sdk import Variable
     access_token = Variable.get("FACEBOOK_TOKEN")
     page_id      = Variable.get("PAGE_ID")
-    return _extraer_y_persistir(access_token, page_id)
+    blob_path, _ = _extraer_y_persistir(access_token, page_id)
+    return blob_path

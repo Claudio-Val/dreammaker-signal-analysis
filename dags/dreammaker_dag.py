@@ -5,19 +5,26 @@ DAG de Airflow para el pipeline incremental de análisis de comentarios
 de Facebook de DreamMaker.
 
 Arquitectura Medallion:
-    Bronze  → data/bronze/   (raw CSV de la API)
-    Silver  → data/silver/   (limpio + embeddings BETO)
-    Gold    → data/gold/     (predicciones + métricas por post)
+    Bronze  → Cloud Storage  (gs://<BUCKET_NAME>/bronze/, CSV crudo de la API)
+    Silver  → BigQuery       (dataset dreammaker_silver: limpio + embeddings BETO)
+    Gold    → BigQuery       (dataset dreammaker_gold: predicciones + métricas por post)
+
+Ver src/config.py para los identificadores de proyecto/bucket/datasets.
 
 Cada task es atómica e idempotente:
-    - Lee su input desde disco (capa anterior)
+    - Lee su input desde la capa anterior (GCS o BigQuery)
     - Detecta el delta respecto a lo ya procesado
-    - Escribe su output a disco (capa actual)
-    - Retorna el path del output via XCom
+    - Escribe su output en la capa actual (GCS o BigQuery)
+    - Retorna el path/table_id del output vía XCom
 
-Credenciales requeridas en Airflow Variables:
+Credenciales requeridas
+------------------------
+Airflow Variables:
     FACEBOOK_TOKEN   token de acceso Facebook Graph API
     PAGE_ID          ID numérico de la página de Facebook
+
+GCP: Application Default Credentials — cuenta de servicio adjunta al
+entorno de ejecución de Airflow (sin configuración adicional en el DAG).
 
 Schedule
 --------
@@ -51,93 +58,99 @@ default_args = {
 # ── DAG ───────────────────────────────────────────────────────────────────────
 with DAG(
     dag_id          = "dreammaker_comments_pipeline",
-    description     = "Pipeline incremental NLP de comentarios Facebook — DreamMaker",
+    description     = "Pipeline incremental NLP de comentarios Facebook — DreamMaker (GCS + BigQuery)",
     default_args    = default_args,
     start_date      = datetime(2024, 1, 1),
     schedule = "0 6 * * *",   # Diario a las 06:00
     catchup         = False,            # No ejecutar corridas históricas pendientes
     max_active_runs = 1,                # Evitar corridas paralelas sobre los mismos datos
-    tags            = ["dreammaker", "nlp", "facebook", "medallion"],
+    tags            = ["dreammaker", "nlp", "facebook", "medallion", "gcp"],
 ) as dag:
 
-    # ── Task 1: Scraping → Bronze ─────────────────────────────────────────────
+    # ── Task 1: Scraping → Bronze (GCS) ───────────────────────────────────────
     t1_scraping = PythonOperator(
         task_id         = "scraping_bronze",
         python_callable = task_scraping,
         doc_md          = """
-        **Scraping → Bronze**
+        **Scraping → Bronze (Cloud Storage)**
 
         Extrae posts y comentarios desde la Facebook Graph API.
-        Detecta comment_id ya presentes en Bronze y persiste solo el delta.
-        Descarta comentarios sin texto (stickers, GIFs, imágenes).
+        Detecta comment_id ya presentes en el CSV de Bronze en GCS y
+        sube solo el delta. Descarta comentarios sin texto (stickers,
+        GIFs, imágenes).
 
-        Output: `data/bronze/facebook_comments_raw.csv`
+        Output: `gs://<BUCKET_NAME>/bronze/facebook_comments_raw.csv`
         """,
     )
 
-    # ── Task 2: Preprocesamiento → Silver CSV ─────────────────────────────────
+    # ── Task 2: Preprocesamiento → Silver clean (BigQuery) ────────────────────
     t2_preprocessing = PythonOperator(
         task_id         = "preprocessing_silver_csv",
         python_callable = task_preprocessing,
         doc_md          = """
-        **Preprocesamiento → Silver CSV**
+        **Preprocesamiento → Silver (BigQuery)**
 
-        Lee Bronze, detecta comentarios no presentes en Silver y aplica
-        limpieza de texto: lowercase, eliminación de tildes, colapso
-        de espacios y signos especiales.
+        Lee Bronze desde GCS, detecta comentarios no presentes en la
+        tabla Silver clean de BigQuery y aplica limpieza de texto:
+        lowercase, eliminación de tildes, colapso de espacios y signos
+        especiales, y tipado de timestamps/contadores.
 
-        Output: `data/silver/facebook_comments_clean.csv`
+        Output: `dreammaker_silver.facebook_comments_clean`
         """,
     )
 
-    # ── Task 3: Embeddings → Silver Parquet ───────────────────────────────────
+    # ── Task 3: Embeddings → Silver embeddings (BigQuery) ─────────────────────
     t3_embeddings = PythonOperator(
         task_id         = "embeddings_silver_parquet",
         python_callable = task_embeddings,
         doc_md          = """
-        **Embeddings → Silver Parquet**
+        **Embeddings → Silver (BigQuery)**
 
-        Lee Silver CSV, detecta comentarios sin embedding y los vectoriza
-        con BETO (dccuchile/bert-base-spanish-wwm-cased), mean pooling
-        sobre última capa oculta → vector 768-dim.
+        Lee Silver clean desde BigQuery, detecta comentarios sin
+        embedding y los vectoriza con BETO
+        (dccuchile/bert-base-spanish-wwm-cased), mean pooling sobre
+        última capa oculta → vector 768-dim.
 
-        Output: `data/silver/facebook_comments_embeddings.parquet`
+        Output: `dreammaker_silver.facebook_comments_embeddings`
         """,
         execution_timeout = timedelta(hours=2),   # BETO sobre miles de comentarios puede demorar
     )
 
-    # ── Task 4: Clasificación → Gold ──────────────────────────────────────────
+    # ── Task 4: Clasificación → Gold (BigQuery) ────────────────────────────────
     t4_clasificacion = PythonOperator(
         task_id         = "clasificacion_gold",
         python_callable = task_clasificacion,
         doc_md          = """
-        **Clasificación jerárquica → Gold**
+        **Clasificación jerárquica → Gold (BigQuery)**
 
-        Capa 1: Logística OvR sobre embeddings → 8 etiquetas multilabel.
-        Capa 2: XGBoost sobre embeddings + Capa 1 → sarcasmo binario.
-        Reglas de negocio: interes_real, elogio_real, critica_genuina,
-        solicitud_real, polarizacion_politica, fanatismo, fanatismo_no_comercial.
+        Descarga los modelos entrenados desde GCS si aún no están en
+        disco local. Capa 1: Logística OvR sobre embeddings → 8
+        etiquetas multilabel. Capa 2: XGBoost sobre embeddings + Capa 1
+        → sarcasmo binario. Reglas de negocio: interes_real,
+        elogio_real, critica_genuina, solicitud_real,
+        polarizacion_politica, fanatismo, fanatismo_no_comercial.
 
         Outputs:
-            `data/gold/facebook_comments_classified.parquet`
-            `data/gold/facebook_comments_probabilities.parquet`
-            `data/gold/facebook_comments_gold_enriched.parquet`
+            `dreammaker_gold.facebook_comments_classified`
+            `dreammaker_gold.facebook_comments_probabilities`
+            `dreammaker_gold.facebook_comments_gold_enriched`
         """,
     )
 
-    # ── Task 5: Agregación → Gold (post metrics) ──────────────────────────────
+    # ── Task 5: Agregación → Gold post metrics (BigQuery) ──────────────────────
     t5_agregacion = PythonOperator(
         task_id         = "agregacion_gold_post_metrics",
         python_callable = task_agregacion,
         doc_md          = """
-        **Agregación → Gold (métricas por publicación)**
+        **Agregación → Gold (métricas por publicación, BigQuery)**
 
-        Opera sobre el Gold classified completo acumulado.
+        Opera sobre el Gold classified completo acumulado en BigQuery.
         Construye señales compuestas (senal_comercial, ruido_social),
         agrega por post_id con suavizado bayesiano y enriquece con
-        clasificación temática por regex.
+        clasificación temática por regex. Reemplaza la tabla completa
+        en cada corrida (WRITE_TRUNCATE).
 
-        Output: `data/gold/facebook_post_metrics.parquet`
+        Output: `dreammaker_gold.facebook_post_metrics`
         """,
     )
 

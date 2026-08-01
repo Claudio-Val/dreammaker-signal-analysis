@@ -12,10 +12,21 @@ Pipeline jerárquico de clasificación en dos capas con reglas de negocio.
               Predice: sarcasmo
               Input  : embeddings + predicciones Capa 1
 
+Lee embeddings desde Silver (BigQuery) y escribe en Gold (BigQuery):
+    facebook_comments_classified, facebook_comments_probabilities,
+    facebook_comments_gold_enriched.
+
+Modelos entrenados
+-------------------
+Los artefactos .pkl NO se versionan en el repo. Se descargan desde
+Cloud Storage (gs://<BUCKET_NAME>/<MODELS_PATH>/) a disco local la
+primera vez que se necesitan (ver gcp_io.descargar_blob_si_falta), y se
+reutilizan en corridas siguientes si ya están presentes en ./models/.
+
 Compatibilidad
 --------------
 - Modo local   : predecir_labels(df) → tuple[pd.DataFrame, ...]
-- Modo Airflow : task_clasificacion(**context) → str (path Gold classified)
+- Modo Airflow : task_clasificacion(**context) → str (table_id de Gold classified)
 """
 
 from pathlib import Path
@@ -24,35 +35,46 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from src import config
+from src.gcp_io import (
+    cargar_dataframe_bq,
+    descargar_blob_si_falta,
+    ids_existentes_bq,
+    leer_tabla_bq,
+)
+from src.schemas import SCHEMA_GOLD_CLASSIFIED, SCHEMA_GOLD_ENRICHED, SCHEMA_GOLD_PROBABILITIES
+
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 _FEATURE_LABELS = [
-    "interes", "elogio_producto", "critica_producto",
-    "fanatismo_emocional", "conflictivo", "otro", "solicitud", "cuidado",
+    "interes",
+    "elogio_producto",
+    "critica_producto",
+    "fanatismo_emocional",
+    "conflictivo",
+    "otro",
+    "solicitud",
+    "cuidado",
 ]
 
-_MODEL_PATHS = {
-    "capa1_model":      Path("models/logistic_ovr_model.pkl"),
-    "capa1_thresholds": Path("models/logistic_ovr_thresholds.pkl"),
-    "capa2_model":      Path("models/xgb_sarcasm_model.pkl"),
-    "capa2_threshold":  Path("models/xgb_sarcasm_threshold.pkl"),
+_MODEL_FILES = {
+    "capa1_model":      "logistic_ovr_model.pkl",
+    "capa1_thresholds": "logistic_ovr_thresholds.pkl",
+    "capa2_model":      "xgb_sarcasm_model.pkl",
+    "capa2_threshold":  "xgb_sarcasm_threshold.pkl",
 }
-
-_GOLD_PATH       = Path("data/gold")
-_GOLD_CLASSIFIED = _GOLD_PATH / "facebook_comments_classified.parquet"
-_GOLD_PROBS      = _GOLD_PATH / "facebook_comments_probabilities.parquet"
-_GOLD_ENRICHED   = _GOLD_PATH / "facebook_comments_gold_enriched.parquet"
-_SILVER_PARQUET  = Path("data/silver/facebook_comments_embeddings.parquet")
+_MODEL_PATHS = {nombre: Path("models") / archivo for nombre, archivo in _MODEL_FILES.items()}
 
 
 # ── Carga de modelos ──────────────────────────────────────────────────────────
 def _cargar_modelos() -> tuple:
-    for nombre, ruta in _MODEL_PATHS.items():
-        if not ruta.exists():
-            raise RuntimeError(
-                f"Modelo no encontrado: {ruta}\n"
-                f"Asegúrate de colocar '{ruta.name}' dentro de models/."
-            )
+    """
+    Descarga los 4 artefactos del pipeline jerárquico desde GCS a disco
+    local si aún no están presentes, y los carga con joblib.
+    """
+    for nombre, archivo in _MODEL_FILES.items():
+        descargar_blob_si_falta(f"{config.MODELS_PATH}/{archivo}", _MODEL_PATHS[nombre])
+
     return (
         joblib.load(_MODEL_PATHS["capa1_model"]),
         joblib.load(_MODEL_PATHS["capa1_thresholds"]),
@@ -84,6 +106,8 @@ def _predecir_capa2(model, threshold, X_emb, df_res, df_probas):
 # ── Reglas de negocio ─────────────────────────────────────────────────────────
 def _aplicar_reglas_negocio(df: pd.DataFrame) -> pd.DataFrame:
     """
+    Deriva etiquetas interpretables a partir de las predicciones binarias.
+
     Reglas
     ------
     solicitud_real        : solicitud=1 AND sarcasmo=0
@@ -91,44 +115,65 @@ def _aplicar_reglas_negocio(df: pd.DataFrame) -> pd.DataFrame:
     elogio_real           : elogio_producto=1 AND sarcasmo=0
     critica_genuina       : critica_producto=1 AND sarcasmo=0 AND conflictivo=0
     polarizacion_politica : conflictivo=1
-    fanatismo             : fanatismo_emocional=1 AND sarcasmo=0
+    fanatismo              : fanatismo_emocional=1 AND sarcasmo=0
     fanatismo_no_comercial: fanatismo_emocional=1 AND sarcasmo=0 AND interes=0
     """
     d = df.copy()
-    d["solicitud_real"]        = ((d["pred_solicitud"] == 1) & (d["pred_sarcasmo"] == 0)).astype(int)
-    d["interes_real"]          = ((d["pred_interes"]   == 1) & (d["pred_sarcasmo"] == 0)).astype(int)
-    d["elogio_real"]           = ((d["pred_elogio_producto"] == 1) & (d["pred_sarcasmo"] == 0)).astype(int)
-    d["critica_genuina"]       = ((d["pred_critica_producto"] == 1) & (d["pred_sarcasmo"] == 0) & (d["pred_conflictivo"] == 0)).astype(int)
-    d["polarizacion_politica"] = (d["pred_conflictivo"] == 1).astype(int)
-    d["fanatismo"]             = ((d["pred_fanatismo_emocional"] == 1) & (d["pred_sarcasmo"] == 0)).astype(int)
-    d["fanatismo_no_comercial"]= ((d["pred_fanatismo_emocional"] == 1) & (d["pred_sarcasmo"] == 0) & (d["pred_interes"] == 0)).astype(int)
+
+    d["solicitud_real"] = (
+        (d["pred_solicitud"] == 1) &
+        (d["pred_sarcasmo"]  == 0)
+    ).astype(int)
+
+    d["interes_real"] = (
+        (d["pred_interes"]  == 1) &
+        (d["pred_sarcasmo"] == 0)
+    ).astype(int)
+
+    d["elogio_real"] = (
+        (d["pred_elogio_producto"] == 1) &
+        (d["pred_sarcasmo"]        == 0)
+    ).astype(int)
+
+    d["critica_genuina"] = (
+        (d["pred_critica_producto"] == 1) &
+        (d["pred_sarcasmo"]         == 0) &
+        (d["pred_conflictivo"]      == 0)
+    ).astype(int)
+
+    d["polarizacion_politica"] = (
+        d["pred_conflictivo"] == 1
+    ).astype(int)
+
+    d["fanatismo"] = (
+        (d["pred_fanatismo_emocional"] == 1) &
+        (d["pred_sarcasmo"]            == 0)
+    ).astype(int)
+
+    d["fanatismo_no_comercial"] = (
+        (d["pred_fanatismo_emocional"] == 1) &
+        (d["pred_sarcasmo"]            == 0) &
+        (d["pred_interes"]             == 0)
+    ).astype(int)
+
     return d
-
-
-# ── Guardado incremental ──────────────────────────────────────────────────────
-def _guardar_gold(df_nuevo: pd.DataFrame, path: Path) -> pd.DataFrame:
-    _GOLD_PATH.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        df_total = pd.concat([pd.read_parquet(path), df_nuevo], ignore_index=True)
-    else:
-        df_total = df_nuevo
-    df_total.to_parquet(path, index=False)
-    return df_total
 
 
 def _clasificar_y_persistir(df: pd.DataFrame) -> str:
     """
-    Lógica central de clasificación. Retorna el path del Gold classified.
+    Lógica central de clasificación. Retorna el table_id de Gold classified.
     Usada tanto en modo local como en modo Airflow.
     """
     if df.empty:
         print("   Sin datos nuevos para clasificar.")
-        return str(_GOLD_CLASSIFIED)
+        return config.TABLE_GOLD_CLASSIFIED
 
     model_c1, thr_c1, model_c2, thr_c2 = _cargar_modelos()
     print("   ✔ Modelos cargados.")
 
-    X_emb        = np.vstack(df["embedding"].values)
+    # .apply(np.array) normaliza tanto listas (recién generadas en embedding.py)
+    # como arrays devueltos por BigQuery para columnas REPEATED FLOAT64.
+    X_emb        = np.vstack(df["embedding"].apply(np.array).values)
     df_resultado = df.copy()
     df_probas    = pd.DataFrame()
 
@@ -144,21 +189,20 @@ def _clasificar_y_persistir(df: pd.DataFrame) -> str:
     print("   Aplicando reglas de negocio...")
     df_gold_enriched = _aplicar_reglas_negocio(df_resultado)
 
-    total_class    = _guardar_gold(df_resultado,    _GOLD_CLASSIFIED)
-    total_probs    = _guardar_gold(df_probas,        _GOLD_PROBS)
-    total_enriched = _guardar_gold(df_gold_enriched, _GOLD_ENRICHED)
+    cargar_dataframe_bq(df_resultado,     config.TABLE_GOLD_CLASSIFIED,    SCHEMA_GOLD_CLASSIFIED,    config.DATASET_GOLD)
+    cargar_dataframe_bq(df_probas,        config.TABLE_GOLD_PROBABILITIES, SCHEMA_GOLD_PROBABILITIES, config.DATASET_GOLD)
+    cargar_dataframe_bq(df_gold_enriched, config.TABLE_GOLD_ENRICHED,      SCHEMA_GOLD_ENRICHED,      config.DATASET_GOLD)
 
     print(f"{'─'*45}")
-    print(f"  {len(df)} comentarios nuevos clasificados.")
-    print(f"  Total acumulado en Gold: {len(total_enriched)} registros.")
+    print(f"  {len(df)} comentarios nuevos clasificados e insertados en Gold (BigQuery).")
     print(f"{'─'*45}")
 
-    return str(_GOLD_CLASSIFIED)
+    return config.TABLE_GOLD_CLASSIFIED
 
 
 # ── Modo local ────────────────────────────────────────────────────────────────
 def predecir_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Clasifica el delta y retorna tupla de DataFrames. Uso: pipeline.py local."""
+    """Clasifica el delta, lo inserta en Gold (BigQuery) y retorna tupla de DataFrames."""
     if df.empty:
         print("   Sin datos nuevos para clasificar.")
         return df, pd.DataFrame(), pd.DataFrame()
@@ -166,7 +210,7 @@ def predecir_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
     model_c1, thr_c1, model_c2, thr_c2 = _cargar_modelos()
     print("   ✔ Modelos cargados.")
 
-    X_emb        = np.vstack(df["embedding"].values)
+    X_emb        = np.vstack(df["embedding"].apply(np.array).values)
     df_resultado = df.copy()
     df_probas    = pd.DataFrame()
 
@@ -182,13 +226,12 @@ def predecir_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
     print("   Aplicando reglas de negocio...")
     df_gold_enriched = _aplicar_reglas_negocio(df_resultado)
 
-    total_class    = _guardar_gold(df_resultado,    _GOLD_CLASSIFIED)
-    total_probs    = _guardar_gold(df_probas,        _GOLD_PROBS)
-    total_enriched = _guardar_gold(df_gold_enriched, _GOLD_ENRICHED)
+    cargar_dataframe_bq(df_resultado,     config.TABLE_GOLD_CLASSIFIED,    SCHEMA_GOLD_CLASSIFIED,    config.DATASET_GOLD)
+    cargar_dataframe_bq(df_probas,        config.TABLE_GOLD_PROBABILITIES, SCHEMA_GOLD_PROBABILITIES, config.DATASET_GOLD)
+    cargar_dataframe_bq(df_gold_enriched, config.TABLE_GOLD_ENRICHED,      SCHEMA_GOLD_ENRICHED,      config.DATASET_GOLD)
 
     print(f"{'─'*45}")
-    print(f"  {len(df)} comentarios nuevos clasificados.")
-    print(f"  Total acumulado en Gold: {len(total_enriched)} registros.")
+    print(f"  {len(df)} comentarios nuevos clasificados e insertados en Gold (BigQuery).")
     print(f"{'─'*45}")
 
     return df_resultado, df_probas, df_gold_enriched
@@ -198,20 +241,17 @@ def predecir_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Da
 def task_clasificacion(**context) -> str:
     """
     Callable para PythonOperator de Airflow.
-    Lee desde Silver Parquet, detecta delta vs Gold classified,
-    clasifica solo los nuevos y hace append.
-    Retorna el path del Gold classified para XCom.
+    Lee Silver embeddings desde BigQuery, detecta el delta vs Gold
+    classified, clasifica solo los nuevos y hace append.
     """
-    ids_clasificados: set = set()
-    if _GOLD_CLASSIFIED.exists():
-        df_class = pd.read_parquet(_GOLD_CLASSIFIED, columns=["comment_id"])
-        ids_clasificados = set(df_class["comment_id"].astype(str).unique())
+    ids_clasificados = ids_existentes_bq(config.TABLE_GOLD_CLASSIFIED, "comment_id")
 
-    df_silver = pd.read_parquet(_SILVER_PARQUET)
+    df_silver = leer_tabla_bq(config.TABLE_SILVER_EMBEDDINGS)
+    if df_silver.empty:
+        print("   Silver embeddings vacío en BigQuery.")
+        return config.TABLE_GOLD_CLASSIFIED
 
-    df_delta = df_silver[
-        ~df_silver["comment_id"].astype(str).isin(ids_clasificados)
-    ].copy()
+    df_delta = df_silver[~df_silver["comment_id"].astype(str).isin(ids_clasificados)].copy()
 
     print(f"Delta para clasificar: {len(df_delta)} comentarios.")
     return _clasificar_y_persistir(df_delta)
