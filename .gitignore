@@ -26,3 +26,15 @@ airflow/
 # Archivos del sistema
 .DS_Store
 Thumbs.db
+
+# Autenticación de GCP
+credentials/
+
+# Test local de credencial GCP
+test_credentials.py
+
+# script de arranque local Airflow Standalone
+start_airflow.sh
+
+# Carpeta de modelos locales
+models/
