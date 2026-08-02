@@ -1,10 +1,26 @@
-# Facebook Comments NLP Pipeline
+# DreamMaker Signal Analysis
+
+![Project Banner](docs/images/dreammaker_banner.jpg)
 
 Pipeline de análisis de lenguaje natural sobre comentarios de Facebook para **DreamMaker**, e-commerce chileno de figuras coleccionables de instituciones y personajes históricos nacionales.
 
 El sistema extrae comentarios en español chileno desde la Facebook Graph API, los vectoriza con BETO (BERT en español), y los clasifica mediante un **clasificador jerárquico en dos capas** que detecta intenciones comerciales y sarcasmo condicionado. El resultado final es un dataset analítico a nivel publicación, enriquecido con métricas agregadas y variables temáticas, listo para consumo en herramientas de visualización como Power BI.
 
-> **Versionado:** esta rama (`feature/airflow-orchestration`) añade **orquestación con Apache Airflow** sobre la arquitectura de clasificación jerárquica descrita en este README. Cada módulo de `src/` mantiene doble compatibilidad: puede ejecutarse en modo local vía `pipeline.py` (para desarrollo, debugging o corridas puntuales) o ser orquestado por el DAG de Airflow (`dags/dreammaker_dag.py`), sin duplicar la lógica de negocio. La versión local sin orquestador se mantiene en [`main`](../../tree/main). El clasificador multiclase de una sola etapa (generación anterior a la arquitectura jerárquica) se conserva en [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de ese cambio anterior, y [Orquestación con Airflow](#orquestación-con-airflow) para el detalle de esta rama.
+> **Versionado:** esta rama (`feature/gcp-bigquery`) migra el almacenamiento del pipeline desde archivos locales a **Google Cloud**: Bronze pasa a vivir en Cloud Storage (CSV) y Silver/Gold pasan a BigQuery, manteniendo intacta la arquitectura Medallion y el clasificador jerárquico descritos en este README. Se construye sobre [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) (que añadió la orquestación con Apache Airflow), y ambas ramas conservan el mismo doble modo de ejecución local/Airflow. La versión puramente local, sin GCP, se mantiene en [`main`](../../tree/main). El clasificador multiclase de una sola etapa se conserva en [`legacy/v1`](../../tree/legacy/v1). En esta rama el pipeline **sigue corriendo en tu máquina** (`python pipeline.py` o Airflow standalone local) — lo único que cambia es dónde persisten los datos; la dockerización y el despliegue en una VM de GCP quedan para una rama futura. Ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud) para el detalle de esta migración.
+
+---
+
+## Qué cambia en esta rama respecto a `feature/airflow-orchestration`
+
+| Aspecto | `feature/airflow-orchestration` | `feature/gcp-bigquery` (esta rama) |
+|---|---|---|
+| Bronze | CSV local (`data/bronze/`) | CSV en Cloud Storage (`gs://<BUCKET_NAME>/bronze/`) |
+| Silver | CSV + Parquet local (`data/silver/`) | Tablas de BigQuery, dataset `dreammaker_silver` |
+| Gold | Parquet local (`data/gold/`) | Tablas de BigQuery, dataset `dreammaker_gold` |
+| Modelos entrenados (`.pkl`) | Locales en `models/`, pensados para versionarse | Se descargan desde `gs://<BUCKET_NAME>/models/` en runtime; `models/` local queda solo como caché, ignorado por git |
+| Autenticación | No aplicaba | Application Default Credentials (ADC), vía `credentials/*.json` + `export GOOGLE_APPLICATION_CREDENTIALS` en la shell (ver [Configuración](#configuración)) |
+| Creación de infraestructura | No aplicaba | El pipeline crea las **tablas** automáticamente (idempotente); el bucket y los **datasets** de BigQuery se crean una vez, a mano |
+| Dónde corre | Local (`pipeline.py` o Airflow standalone) | Igual: local — la migración a VM/Docker queda para una rama futura |
 
 ---
 
@@ -44,18 +60,18 @@ El pipeline implementa una arquitectura **Medallion** (Bronze → Silver → Gol
 ```
 pipeline.py
 │
-├── [1] scraper_facebook.py   →  data/bronze/
-├── [2] preprocessing.py      →  data/silver/  (CSV)
-├── [3] embedding.py          →  data/silver/  (Parquet)
-├── [4] classification.py     →  data/gold/    (comentarios)
-└── [5] aggregation.py        →  data/gold/    (publicaciones)
+├── [1] scraper_facebook.py   →  Cloud Storage   (bronze/facebook_comments_raw.csv)
+├── [2] preprocessing.py      →  BigQuery        (dreammaker_silver.facebook_comments_clean)
+├── [3] embedding.py          →  BigQuery        (dreammaker_silver.facebook_comments_embeddings)
+├── [4] classification.py     →  BigQuery        (dreammaker_gold.facebook_comments_*)
+└── [5] aggregation.py        →  BigQuery        (dreammaker_gold.facebook_post_metrics)
 ```
 
 ### Comportamiento incremental
 
-En cada ejecución, el pipeline detecta automáticamente qué comentarios son nuevos comparando contra Bronze y procesa **únicamente el delta**. Si no hay comentarios nuevos, cada módulo lo informa y sale limpiamente sin modificar los archivos existentes.
+En cada ejecución, el pipeline detecta automáticamente qué comentarios son nuevos comparando IDs contra la capa siguiente (Bronze en GCS, Silver/Gold en BigQuery) y procesa **únicamente el delta**. Si no hay comentarios nuevos, cada módulo lo informa y sale limpiamente sin modificar lo ya persistido.
 
-En la primera ejecución, procesa y persiste todo desde cero sin configuración adicional.
+En la primera ejecución, procesa y persiste todo desde cero sin configuración adicional (más allá de tener el bucket y los datasets ya creados — ver [Configuración](#configuración)).
 
 La única excepción es el módulo de agregación (`aggregation.py`), que siempre recalcula sobre el **Gold completo acumulado**, no solo sobre el delta (ver detalle más abajo).
 
@@ -65,53 +81,78 @@ Cada módulo de `src/` expone tres funciones con una responsabilidad clara:
 
 | Función | Uso | Firma |
 |---|---|---|
-| `_xxx_y_persistir(df)` | Lógica de negocio real (privada, compartida) | recibe/retorna datos, escribe a disco, retorna el `path` de salida |
+| `_xxx_y_persistir(df)` | Lógica de negocio real (privada, compartida) | recibe/retorna datos, escribe en GCS/BigQuery, retorna el `path` o `table_id` de salida |
 | Función pública "modo local" (ej. `generar_embeddings`, `predecir_labels`) | Llamada por `pipeline.py` | recibe un `DataFrame` en memoria (el delta ya calculado por la etapa anterior), retorna `DataFrame` |
-| `task_xxx(**context)` | Callable de `PythonOperator` en el DAG | sin `DataFrame` como input: lee su propia entrada desde el archivo de la capa anterior, calcula el delta comparando IDs contra su propia capa de salida, y retorna el `path` del archivo generado (para XCom) |
+| `task_xxx(**context)` | Callable de `PythonOperator` en el DAG | sin `DataFrame` como input: lee su propia entrada desde la capa anterior (GCS o BigQuery), calcula el delta comparando IDs contra su propia capa de salida, y retorna el `path`/`table_id` generado (para XCom) |
 
-Ambas interfaces (local y Airflow) llaman a la misma lógica interna (`_xxx_y_persistir`), así que el comportamiento —incluyendo el procesamiento incremental— es idéntico sin importar cómo se ejecute el pipeline. Esto permite seguir usando `pipeline.py` para pruebas rápidas o notebooks, mientras Airflow gestiona la ejecución productiva (schedule, reintentos, alertas, historial de corridas).
+Ambas interfaces (local y Airflow) llaman a la misma lógica interna (`_xxx_y_persistir`), así que el comportamiento —incluyendo el procesamiento incremental— es idéntico sin importar cómo se ejecute el pipeline.
 
-> **¿Por qué las tasks de Airflow no reciben ni retornan DataFrames vía XCom?** XCom no está pensado para transportar objetos grandes como un `DataFrame` de miles de embeddings de 768 dimensiones — tiene límites de tamaño y agregaría overhead de serialización innecesario. En su lugar, cada task lee y escribe directamente en la capa Bronze/Silver/Gold correspondiente en disco, y solo pasa el `path` del archivo resultante por XCom. Esto además hace que cada task sea atómica, idempotente y reintentable de forma independiente: si una task falla y Airflow la reintenta, simplemente vuelve a leer el estado actual del disco y recalcula su propio delta, sin depender de que la ejecución anterior haya dejado algo en memoria.
+> **¿Por qué las tasks de Airflow no reciben ni retornan DataFrames vía XCom?** XCom no está pensado para transportar objetos grandes como un `DataFrame` de miles de embeddings de 768 dimensiones. En su lugar, cada task lee y escribe directamente en la capa Bronze (GCS) o Silver/Gold (BigQuery) correspondiente, y solo pasa el `path` del blob o el `table_id` resultante por XCom. Esto además hace que cada task sea atómica, idempotente y reintentable de forma independiente: si una task falla y Airflow la reintenta, simplemente vuelve a leer el estado actual de GCS/BigQuery y recalcula su propio delta.
+
+---
+
+## Almacenamiento en Google Cloud
+
+| Capa | Servicio | Ubicación |
+|---|---|---|
+| Bronze | Cloud Storage | `gs://<BUCKET_NAME>/bronze/facebook_comments_raw.csv` |
+| Silver | BigQuery | dataset `dreammaker_silver` |
+| Gold | BigQuery | dataset `dreammaker_gold` |
+| Modelos entrenados | Cloud Storage | `gs://<BUCKET_NAME>/models/` |
+| Reportes / análisis exploratorio | Cloud Storage | `gs://<BUCKET_NAME>/reports/` |
+
+**Por qué Bronze en GCS y no en BigQuery:** Bronze es el dato crudo, sin tipar ni transformar, tal como llega de la API — un caso de uso natural de *object storage* más que de un warehouse consultable. Silver y Gold sí necesitan agregarse, filtrarse y consultarse (ej. desde Power BI), por lo que viven en BigQuery.
+
+**Cómo funciona el incremental contra cada servicio:**
+- **GCS** no soporta append nativo a un blob existente (los objetos son inmutables). El patrón usado (`src/gcp_io.py::escribir_csv_gcs`) es: descargar el CSV existente, concatenar en memoria con el delta nuevo, y volver a subir el archivo completo.
+- **BigQuery** sí soporta append del lado del servidor: cada módulo consulta `SELECT DISTINCT <id>` para saber qué ya existe, y hace un *load job* en modo `WRITE_APPEND` con el delta — sin traer la tabla completa a memoria. La única excepción es `facebook_post_metrics`, que se recalcula entero cada corrida y se sube en modo `WRITE_TRUNCATE` (reemplaza la tabla completa), porque el prior bayesiano depende de todos los datos, no de un delta.
+
+**Creación de infraestructura — qué automatiza el código y qué no:** El pipeline crea automáticamente las **tablas** de BigQuery si no existen (con schema explícito, ver `src/schemas.py`), pero **no crea los datasets** (`dreammaker_silver`, `dreammaker_gold`) ni el **bucket**. Esos se crean una única vez, a mano (o vía IaC en el futuro) — ver los comandos en [Configuración](#configuración). Es una decisión deliberada: crear datasets/buckets es una operación de infraestructura poco frecuente que conviene hacer explícita, en vez de que quede escondida dentro de la primera corrida del pipeline.
+
+**Embeddings en BigQuery:** los vectores de 768 dimensiones (`embedding`, `post_embedding`) se guardan como columnas `FLOAT64` en modo `REPEATED` — el equivalente de BigQuery a un array de floats por fila. Al leerlos de vuelta con la librería cliente, cada celda vuelve como una lista/array de Python, que se re-normaliza con `np.array(...)` antes de alimentar los modelos.
+
+**Modelos entrenados:** los `.pkl` (`logistic_ovr_model.pkl`, `logistic_ovr_thresholds.pkl`, `xgb_sarcasm_model.pkl`, `xgb_sarcasm_threshold.pkl`) **ya no se versionan en git**. Se suben a mano a `gs://<BUCKET_NAME>/models/` una vez entrenados, y `classification.py` los descarga a `./models/` (carpeta local ignorada por git, usada como caché) la primera vez que se necesitan — en corridas siguientes, si ya están en disco, no se vuelven a descargar.
 
 ---
 
 ## Etapas del pipeline
 
-### 1. Scraping — Bronze
+### 1. Scraping — Bronze (Cloud Storage)
 
 Extrae posts y comentarios desde la **Facebook Graph API v18.0** con paginación segura.
 
 - Deduplicación de posts y comentarios por ID en memoria
 - Control de loops de paginación mediante set de URLs visitadas
 - Descarte temprano de comentarios sin texto (stickers, GIFs, imágenes) antes de persistir
-- Detección incremental: carga los `comment_id` existentes en Bronze y hace append solo con los nuevos
+- Detección incremental: carga los `comment_id` existentes en el CSV de Bronze en GCS y solo sube (y retorna) el delta
 
-**Salida:** `data/bronze/facebook_comments_raw.csv`
+**Salida:** `gs://<BUCKET_NAME>/bronze/facebook_comments_raw.csv`
 
-### 2. Preprocesamiento — Silver CSV
+### 2. Preprocesamiento — Silver (BigQuery)
 
-Limpieza de texto sobre el delta recibido desde Bronze.
+Limpieza de texto y tipado sobre el delta recibido desde Bronze.
 
 - Filtrado de filas con `comment_message` vacío (segunda línea de defensa)
 - Normalización: lowercase, eliminación de tildes (NFD), colapso de saltos de línea y espacios múltiples, colapso de signos repetidos
 - Genera `clean_comment_message` y `clean_post_message`
-- Append incremental al Silver CSV
+- Castea `post_created`/`comment_created` a `TIMESTAMP` y los contadores de reacciones a `INTEGER`, para que calcen con el schema de BigQuery
+- Append incremental (`WRITE_APPEND`) a la tabla Silver
 
-**Salida:** `data/silver/facebook_comments_clean.csv`
+**Salida:** tabla `dreammaker_silver.facebook_comments_clean`
 
-### 3. Embeddings — Silver Parquet
+### 3. Embeddings — Silver (BigQuery)
 
 Vectorización con **BETO** (`dccuchile/bert-base-spanish-wwm-cased`), modelo BERT preentrenado en español.
 
 - Mean pooling sobre la última capa oculta → vector de 768 dimensiones
-- Genera `embedding` (comentario) y `post_embedding` (publicación)
+- Genera `embedding` (comentario) y `post_embedding` (publicación), guardados como `FLOAT64 REPEATED`
 - Procesamiento por lotes configurable (`batch_size=32`)
 - El modelo se carga una sola vez al importar el módulo
-- Append incremental al Parquet Silver
+- Append incremental a la tabla Silver
 
-**Salida:** `data/silver/facebook_comments_embeddings.parquet`
+**Salida:** tabla `dreammaker_silver.facebook_comments_embeddings`
 
-### 4. Clasificación jerárquica — Gold (comentarios)
+### 4. Clasificación jerárquica — Gold (BigQuery)
 
 El problema de clasificación se aborda mediante una **arquitectura jerárquica de dos capas**, diseñada para desacoplar la interpretación semántica general de la detección específica de sarcasmo.
 
@@ -144,6 +185,10 @@ Modelo **XGBoost** que recibe como input la **concatenación** del embedding del
 
 Desde el punto de vista del aprendizaje automático, el sarcasmo deja de ser una tarea aislada para convertirse en una **clasificación contextualizada**: el modelo dispone de información explícita sobre la intención aparente del comentario, lo que le permite distinguir con mayor precisión entre expresiones literales e irónicas.
 
+#### Modelos entrenados
+
+Los 4 artefactos (`logistic_ovr_model.pkl`, `logistic_ovr_thresholds.pkl`, `xgb_sarcasm_model.pkl`, `xgb_sarcasm_threshold.pkl`) se descargan automáticamente desde `gs://<BUCKET_NAME>/models/` a `./models/` la primera vez que `classification.py` los necesita — ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud).
+
 #### Reglas de negocio
 
 Las predicciones de ambas capas se combinan mediante reglas lógicas para construir etiquetas orientadas al análisis comercial:
@@ -158,12 +203,12 @@ Las predicciones de ambas capas se combinan mediante reglas lógicas para constr
 | `fanatismo` | `fanatismo_emocional=1` AND `sarcasmo=0` |
 | `fanatismo_no_comercial` | `fanatismo_emocional=1` AND `sarcasmo=0` AND `interes=0` |
 
-**Salidas:**
-- `data/gold/facebook_comments_classified.parquet` — predicciones binarias
-- `data/gold/facebook_comments_probabilities.parquet` — probabilidades por etiqueta
-- `data/gold/facebook_comments_gold_enriched.parquet` — columnas originales + predicciones + reglas de negocio
+**Salidas (tablas BigQuery, dataset `dreammaker_gold`):**
+- `facebook_comments_classified` — predicciones binarias
+- `facebook_comments_probabilities` — probabilidades por etiqueta
+- `facebook_comments_gold_enriched` — columnas originales + predicciones + reglas de negocio
 
-### 5. Agregación — Gold (publicaciones)
+### 5. Agregación — Gold (BigQuery)
 
 Una vez clasificadas todas las interacciones individuales, el pipeline cambia la unidad de análisis desde el comentario hacia la **publicación**. Esta transformación constituye uno de los principales aportes del pipeline.
 
@@ -190,7 +235,7 @@ donde `α = mediana del volumen de comentarios por publicación` (prior adaptati
 
 Se calculan volúmenes y proporciones suavizadas para: interés, solicitudes, elogios, críticas, polarización, fanatismo, fanatismo no comercial, señal comercial y ruido social.
 
-Este módulo siempre opera sobre el **Gold completo acumulado** (no solo el delta) para que el prior sea consistente con todos los datos disponibles, y re-aplica las reglas de negocio de `classification.py` en cada ejecución para reflejar siempre la versión actual de las reglas.
+Este módulo siempre lee el **Gold classified completo** desde BigQuery (no solo el delta) para que el prior sea consistente con todos los datos disponibles, y re-aplica las reglas de negocio de `classification.py` en cada ejecución para reflejar siempre la versión actual de las reglas. El resultado reemplaza la tabla de métricas completa (`WRITE_TRUNCATE`) en cada corrida.
 
 #### Clasificación temática de publicaciones
 
@@ -207,7 +252,7 @@ Variables binarias inferidas por regex sobre el texto de la publicación (no mut
 | `post_guerra_pacifico` | Guerra del Pacífico |
 | `post_personajes_historicos` | Personajes históricos chilenos (Allende, Pinochet, O'Higgins, Prat, etc.) |
 
-**Salida:** `data/gold/facebook_post_metrics.parquet`
+**Salida:** tabla `dreammaker_gold.facebook_post_metrics`
 
 ---
 
@@ -218,40 +263,44 @@ dreammaker-signal-analysis/
 │
 ├── src/
 │   ├── __init__.py
-│   ├── scraper_facebook.py      # Extracción desde Facebook Graph API (modo local + task_scraping)
-│   ├── preprocessing.py         # Limpieza de texto (modo local + task_preprocessing)
-│   ├── embedding.py             # Vectorización con BETO (modo local + task_embeddings)
-│   ├── classification.py        # Clasificador jerárquico + reglas de negocio (modo local + task_clasificacion)
-│   └── aggregation.py           # Métricas por publicación + suavizado bayesiano (modo local + task_agregacion)
+│   ├── config.py                 # Configuración central: proyecto GCP, bucket, datasets, tablas
+│   ├── schemas.py                 # Schemas explícitos de BigQuery (tablas Silver y Gold)
+│   ├── gcp_io.py                  # Helpers de I/O compartidos contra Cloud Storage y BigQuery
+│   ├── scraper_facebook.py        # Extracción desde Facebook Graph API → Bronze (GCS)
+│   ├── preprocessing.py           # Limpieza de texto → Silver (BigQuery)
+│   ├── embedding.py               # Vectorización con BETO → Silver (BigQuery)
+│   ├── classification.py          # Clasificador jerárquico + reglas de negocio → Gold (BigQuery)
+│   └── aggregation.py             # Métricas por publicación + suavizado bayesiano → Gold (BigQuery)
 │
 ├── dags/
-│   └── dreammaker_dag.py        # DAG de Airflow: encadena las 5 etapas como PythonOperators
+│   └── dreammaker_dag.py         # DAG de Airflow: encadena las 5 etapas como PythonOperators
 │
-├── models/
-│   ├── logistic_ovr_model.pkl       # Capa 1: modelo OvR entrenado
-│   ├── logistic_ovr_thresholds.pkl  # Capa 1: thresholds por etiqueta
-│   ├── xgb_sarcasm_model.pkl        # Capa 2: modelo XGBoost
-│   └── xgb_sarcasm_threshold.pkl    # Capa 2: threshold de sarcasmo
+├── docs/
+│   └── images/
+│       └── dreammaker_banner.jpg # Banner del proyecto usado en este README
 │
-├── data/                         # Bronze / Silver / Gold (no incluida en el repo)
-├── labeling/                     # Dataset de entrenamiento (no incluida en el repo)
-├── outputs/                      # Resultados y exportaciones del análisis
-├── airflow/                      # AIRFLOW_HOME local: airflow.cfg, metadata db, logs (no incluida en el repo)
-├── .venv_airflow/                # Entorno virtual dedicado a Airflow (no incluida en el repo)
 ├── reports/
 │   └── DreamMaker_Commercial_Analysis_Report.pdf
 │
+├── models/                       # Caché local de modelos descargados desde GCS (no incluida en el repo)
+├── data/                         # Legado de exploración local en notebooks (no incluida en el repo)
+├── labeling/                     # Dataset de entrenamiento (no incluida en el repo)
+├── outputs/                      # Resultados y exportaciones del análisis (no incluida en el repo)
+├── credentials/                  # JSON de la cuenta de servicio de GCP (no incluida en el repo)
+├── airflow/                      # AIRFLOW_HOME local: airflow.cfg, metadata db, logs (no incluida en el repo)
+├── .venv_airflow/                # Entorno virtual dedicado a Airflow (no incluida en el repo)
+│
 ├── pipeline.py                   # Orquestador principal — modo local
-├── start_airflow.sh              # Levanta Airflow standalone apuntando a este proyecto
+├── start_airflow.sh              # Levanta Airflow standalone apuntando a este proyecto (no incluida en el repo)
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-├── my_env.env.example            # Plantilla de variables de entorno (modo local)
+├── my_env.env                    # Variables de entorno (no incluida en el repo)
 ├── 01_semantic_classification_pipeline.ipynb
 └── 02_commercial_signal_analysis.ipynb
 ```
 
-> **Nota:** Las carpetas `data/`, `labeling/`, `airflow/` y `.venv_airflow/` no se incluyen en el repositorio. `data/` se crea automáticamente al ejecutar el pipeline (local o vía Airflow). `labeling/` contiene muestras reales de comentarios y publicaciones de la PYME utilizadas para entrenar los modelos de Capa 1 y Capa 2, por lo que se omite por confidencialidad de los datos del cliente. `airflow/` es el `AIRFLOW_HOME` generado localmente (contiene `airflow.cfg`, la base de datos de metadata y logs) y `.venv_airflow/` es el entorno virtual donde se instala Apache Airflow; ambos se generan siguiendo los pasos de [Orquestación con Airflow](#orquestación-con-airflow). El notebook `01_semantic_classification_pipeline.ipynb` documenta la metodología de entrenamiento (features, arquitectura, thresholds, evaluación), pero no es 100% reproducible de punta a punta sin ese dataset.
+> **Nota:** `data/`, `labeling/`, `outputs/`, `credentials/`, `airflow/`, `.venv_airflow/`, `models/`, `my_env.env` y `start_airflow.sh` no se incluyen en el repositorio (ver `.gitignore`). `credentials/` guarda el JSON de la cuenta de servicio usada para autenticarse localmente contra GCP — nunca se versiona, por razones obvias de seguridad. `models/` ahora es solo una caché local: se puebla automáticamente al correr el pipeline, descargando los artefactos desde `gs://<BUCKET_NAME>/models/` (antes, en `feature/airflow-orchestration`, se pensaba para versionarse en git). `labeling/` contiene muestras reales de comentarios y publicaciones de la PYME utilizadas para entrenar los modelos de Capa 1 y Capa 2, por lo que se omite por confidencialidad de los datos del cliente. El notebook `01_semantic_classification_pipeline.ipynb` documenta la metodología de entrenamiento (features, arquitectura, thresholds, evaluación), pero no es 100% reproducible de punta a punta sin ese dataset.
 
 ---
 
@@ -260,6 +309,7 @@ dreammaker-signal-analysis/
 ```bash
 git clone https://github.com/Claudio-Val/dreammaker-signal-analysis.git
 cd dreammaker-signal-analysis
+git checkout feature/gcp-bigquery
 pip install -r requirements.txt
 ```
 
@@ -269,20 +319,14 @@ Requiere **Python 3.12**.
 
 ## Configuración
 
-Crea el archivo `my_env.env` en la raíz del proyecto a partir de la plantilla:
+### Credenciales de Facebook
 
-```bash
-cp my_env.env.example my_env.env
-```
-
-Edita `my_env.env` con tus credenciales:
+Crea el archivo `my_env.env` en la raíz del proyecto con:
 
 ```env
 FACEBOOK_TOKEN=your_facebook_page_access_token_here
 PAGE_ID=your_facebook_page_id_here
 ```
-
-### Cómo obtener las credenciales
 
 | Variable | Descripción | Dónde obtenerla |
 |---|---|---|
@@ -291,11 +335,59 @@ PAGE_ID=your_facebook_page_id_here
 
 > **Importante:** El token de acceso de página tiene una duración limitada. Para uso en producción se recomienda generar un token de larga duración desde la documentación oficial de Meta.
 
+### Configuración de Google Cloud
+
+Todos los identificadores de proyecto/bucket/datasets/tablas viven centralizados en `src/config.py`:
+
+| Constante | Valor por defecto | Descripción |
+|---|---|---|
+| `PROJECT_ID` | `learned-surge-481419-p1` | Proyecto de GCP (override: env var `GCP_PROJECT_ID`) |
+| `BQ_LOCATION` | `US` | Región de los datasets de BigQuery (override: `BQ_LOCATION`) |
+| `BUCKET_NAME` | `dreammaker-mlops` | Bucket de Cloud Storage (override: `GCS_BUCKET_NAME`) |
+| `DATASET_BRONZE` | `bronze` | Prefijo/carpeta de Bronze dentro del bucket (no es un dataset de BigQuery) |
+| `DATASET_SILVER` | `dreammaker_silver` | Dataset de BigQuery para Silver |
+| `DATASET_GOLD` | `dreammaker_gold` | Dataset de BigQuery para Gold |
+| `MODELS_PATH` | `models` | Prefijo de los modelos entrenados dentro del bucket |
+| `REPORTS_PATH` | `reports` | Prefijo de reportes/exploración dentro del bucket |
+
+Si tu proyecto, bucket o región difieren de los valores por defecto, agrégalos a `my_env.env` (por ejemplo `GCP_PROJECT_ID=otro-proyecto`) en vez de editar `config.py`.
+
+**Prerrequisitos de infraestructura — se crean una sola vez, a mano** (el pipeline crea las tablas automáticamente, pero no el bucket ni los datasets — ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud)):
+
+```bash
+# Bucket de Cloud Storage
+gsutil mb -l US gs://dreammaker-mlops
+
+# Datasets de BigQuery
+bq mk --dataset --location=US learned-surge-481419-p1:dreammaker_silver
+bq mk --dataset --location=US learned-surge-481419-p1:dreammaker_gold
+
+# Subir los modelos ya entrenados (ver 01_semantic_classification_pipeline.ipynb)
+gsutil cp models/*.pkl gs://dreammaker-mlops/models/
+```
+
+**Autenticación (Application Default Credentials):**
+
+En esta rama el pipeline corre en tu máquina, así que la autenticación se resuelve con el JSON de una cuenta de servicio guardado localmente:
+
+```bash
+mkdir -p credentials
+# copia tu JSON de cuenta de servicio a credentials/gcp-service-account.json
+export GOOGLE_APPLICATION_CREDENTIALS=$PWD/credentials/gcp-service-account.json
+python pipeline.py
+```
+
+Puntos importantes:
+- `credentials/` está en `.gitignore` — el JSON nunca se versiona.
+- La ruta **no** se guarda en `my_env.env` ni en ningún otro archivo del proyecto: el `export` se hace a mano en cada sesión de terminal antes de correr el pipeline (o se agrega al `.bashrc`/`.zshrc` local de cada quien, fuera del repo).
+- Ningún módulo de `src/` recibe esta ruta como parámetro ni la referencia directamente — `google-cloud-storage` y `google-cloud-bigquery` la resuelven solos vía ADC. Esto es intencional: cuando este proyecto se despliegue en una VM de GCP (rama futura), simplemente no se exporta esta variable ahí, y las mismas librerías caen automáticamente a la cuenta de servicio adjunta a la VM, sin tocar una línea de código.
+- La cuenta de servicio necesita, como mínimo, `roles/bigquery.dataEditor` + `roles/bigquery.jobUser` sobre el proyecto, y `roles/storage.objectAdmin` sobre el bucket.
+
 ---
 
 ## Orquestación con Airflow
 
-Esta rama añade un **DAG de Apache Airflow** (`dags/dreammaker_dag.py`) que orquesta las mismas 5 etapas del pipeline como tasks independientes, en reemplazo de la ejecución secuencial de `pipeline.py` para uso productivo.
+Esta rama conserva el **DAG de Apache Airflow** (`dags/dreammaker_dag.py`) heredado de `feature/airflow-orchestration`, que orquesta las mismas 5 etapas como tasks independientes — ahora leyendo y escribiendo contra GCS/BigQuery en vez de disco local.
 
 ```
 dreammaker_comments_pipeline (dag_id)
@@ -303,98 +395,42 @@ dreammaker_comments_pipeline (dag_id)
 scraping_bronze  →  preprocessing_silver_csv  →  embeddings_silver_parquet  →  clasificacion_gold  →  agregacion_gold_post_metrics
 ```
 
-Cada task corresponde a un `PythonOperator` que ejecuta el `task_xxx(**context)` del módulo respectivo (ver [Doble modo de ejecución](#doble-modo-de-ejecución-local-y-airflow)):
-
 | Task | Callable | Lee | Escribe |
 |---|---|---|---|
-| `scraping_bronze` | `task_scraping` | Facebook Graph API | `data/bronze/facebook_comments_raw.csv` |
-| `preprocessing_silver_csv` | `task_preprocessing` | Bronze | `data/silver/facebook_comments_clean.csv` |
-| `embeddings_silver_parquet` | `task_embeddings` | Silver CSV | `data/silver/facebook_comments_embeddings.parquet` |
-| `clasificacion_gold` | `task_clasificacion` | Silver Parquet | `data/gold/facebook_comments_*.parquet` |
-| `agregacion_gold_post_metrics` | `task_agregacion` | Gold classified (completo) | `data/gold/facebook_post_metrics.parquet` |
+| `scraping_bronze` | `task_scraping` | Facebook Graph API | `gs://<BUCKET_NAME>/bronze/facebook_comments_raw.csv` |
+| `preprocessing_silver_csv` | `task_preprocessing` | Bronze (GCS) | `dreammaker_silver.facebook_comments_clean` |
+| `embeddings_silver_parquet` | `task_embeddings` | Silver clean (BigQuery) | `dreammaker_silver.facebook_comments_embeddings` |
+| `clasificacion_gold` | `task_clasificacion` | Silver embeddings (BigQuery) | `dreammaker_gold.facebook_comments_*` |
+| `agregacion_gold_post_metrics` | `task_agregacion` | Gold classified completo (BigQuery) | `dreammaker_gold.facebook_post_metrics` |
 
-Configuración del DAG: `schedule = "0 6 * * *"` (diario a las 06:00), `catchup=False` (no ejecuta corridas históricas pendientes), `max_active_runs=1` (evita corridas paralelas sobre los mismos archivos) y `retries=2` con `retry_delay=5min` por task. La task de embeddings tiene un `execution_timeout` de 2 horas, ya que la inferencia con BETO sobre volúmenes grandes de comentarios nuevos puede ser lenta.
+Configuración del DAG sin cambios respecto a la rama anterior: `schedule = "0 6 * * *"`, `catchup=False`, `max_active_runs=1`, `retries=2` con `retry_delay=5min` por task, y `execution_timeout` de 2 horas en la task de embeddings.
 
-### Configuración del entorno de Airflow
+La configuración de entorno (`.venv_airflow/`, `start_airflow.sh`, `dags_folder`, Airflow Variables para `FACEBOOK_TOKEN`/`PAGE_ID`) es la misma que en `feature/airflow-orchestration` — no repetida acá para evitar duplicación; ver esa rama para el detalle paso a paso.
 
-1. **Entorno virtual dedicado.** Airflow se instala en un entorno virtual separado del resto del proyecto (`.venv_airflow/`), para aislar sus dependencias:
-
-   ```bash
-   python -m venv .venv_airflow
-   source .venv_airflow/bin/activate
-   pip install apache-airflow
-   pip install -r requirements.txt   # dependencias del pipeline (transformers, xgboost, etc.)
-   ```
-
-2. **Primer arranque.** El script `start_airflow.sh` (en la raíz del proyecto) fija `AIRFLOW_HOME` dentro del propio proyecto y agrega la raíz del proyecto al `PYTHONPATH` (necesario para que los `PythonOperator` puedan hacer `from src... import ...`):
-
-   ```bash
-   #!/bin/bash
-   PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-   source "$PROJECT_DIR/.venv_airflow/bin/activate"
-   export AIRFLOW_HOME="$PROJECT_DIR/airflow"
-   export PYTHONPATH="$PROJECT_DIR"
-   airflow standalone
-   ```
-
-   La primera vez que se ejecuta (`./start_airflow.sh`), Airflow genera automáticamente `airflow/airflow.cfg` y la base de datos de metadata dentro de `airflow/` (carpeta ignorada por git — ver `.gitignore`).
-
-3. **Apuntar `dags_folder` a la carpeta del proyecto.** Por defecto, Airflow espera los DAGs dentro de `$AIRFLOW_HOME/dags` (es decir, `airflow/dags/`), pero esa carpeta está fuera del control de versiones porque `airflow/` completo está en `.gitignore`. Como este proyecto versiona sus DAGs en `dags/` (junto a `pipeline.py`, `src/`, etc.), es necesario redirigir `dags_folder` hacia esa ruta. Tras el primer arranque, detén Airflow (`Ctrl+C`) y edita `airflow/airflow.cfg`:
-
-   ```ini
-   [core]
-   dags_folder = /ruta/absoluta/a/dreammaker-signal-analysis/dags
-   ```
-
-   Alternativamente, sin tocar el `.cfg`, se puede fijar vía variable de entorno (por ejemplo, agregando la línea antes del `airflow standalone` en `start_airflow.sh`):
-
-   ```bash
-   export AIRFLOW__CORE__DAGS_FOLDER="$PROJECT_DIR/dags"
-   ```
-
-   Cualquiera de las dos opciones logra lo mismo: que Airflow lea el DAG desde la carpeta versionada en git en lugar de la carpeta `dags/` por defecto dentro de `AIRFLOW_HOME`.
-
-4. **Credenciales vía Airflow Variables.** En modo orquestado, `task_scraping` ya no lee `my_env.env`: obtiene las credenciales desde **Airflow Variables** (`airflow.sdk.Variable.get(...)`). Deben configurarse una vez, vía UI (`Admin → Variables`) o CLI:
-
-   ```bash
-   airflow variables set FACEBOOK_TOKEN "tu_token_de_acceso"
-   airflow variables set PAGE_ID "tu_page_id"
-   ```
-
-   > `my_env.env` sigue siendo necesario si además se quiere seguir corriendo `python pipeline.py` en modo local (ver [Configuración](#configuración)) — ambos mecanismos de credenciales conviven porque cada módulo mantiene su doble interfaz.
-
-### Ejecutar el pipeline orquestado
-
-```bash
-./start_airflow.sh
-```
-
-Esto levanta Airflow en modo `standalone` (scheduler + webserver + base de datos SQLite de metadata) en `http://localhost:8080`, con las credenciales de acceso a la UI impresas en consola en el primer arranque. El DAG `dreammaker_comments_pipeline` aparece en la UI y puede activarse (schedule diario) o dispararse manualmente:
-
-```bash
-airflow dags trigger dreammaker_comments_pipeline
-```
+**Credenciales de GCP en modo Airflow (en esta rama):** como `start_airflow.sh` se ejecuta en la misma sesión de terminal donde exportaste `GOOGLE_APPLICATION_CREDENTIALS`, el proceso de Airflow hereda esa variable y se autentica igual que el modo local — no requiere configuración adicional por ahora. Esto es una particularidad de correr Airflow *standalone* en tu propia máquina; cuando el pipeline se despliegue en una VM (rama futura), este mecanismo cambiará por la cuenta de servicio adjunta a la instancia.
 
 ---
 
 ## Uso
 
 ```bash
+export GOOGLE_APPLICATION_CREDENTIALS=$PWD/credentials/gcp-service-account.json
 python pipeline.py
 ```
 
-El pipeline detecta automáticamente si es la primera ejecución o si hay comentarios nuevos desde la última vez que se corrió. Esta forma de ejecución (modo local, sin Airflow) sigue siendo válida en esta rama para pruebas rápidas o debugging — ver [Orquestación con Airflow](#orquestación-con-airflow) para el modo de ejecución productivo.
+El pipeline detecta automáticamente si es la primera ejecución o si hay comentarios nuevos desde la última vez que se corrió.
 
 **Salida esperada:**
 
 ```
 [1/5] Extrayendo comentarios nuevos desde Facebook...
-  Bronze existente cargado: 2961 comment_id registrados.
+  Bronze existente en GCS: 2961 comment_id registrados.
   Posts extraídos desde la API: 197
   Comentarios únicos extraídos desde la API: 2985
   ─────────────────────────────────────────────
-  24 comentarios nuevos agregados a Bronze.
+  24 comentarios nuevos subidos a Bronze (GCS).
   Total Bronze acumulado: 2985 registros.
+  gs://dreammaker-mlops/bronze/facebook_comments_raw.csv
   ─────────────────────────────────────────────
 
 [2/5] Preprocesando comentarios nuevos...
@@ -422,21 +458,24 @@ El pipeline detecta automáticamente si es la primera ejecución o si hay coment
 | `python-dotenv` | Carga de variables de entorno |
 | `joblib` | Serialización de modelos |
 | `tqdm` | Barras de progreso en generación de embeddings |
+| `google-cloud-storage` | Lectura/escritura de Bronze y descarga de modelos desde GCS |
+| `google-cloud-bigquery` | Lectura/escritura de Silver y Gold en BigQuery |
+| `pyarrow` | Requerido por `google-cloud-bigquery` para cargar DataFrames vía `load_table_from_dataframe` |
 | `apache-airflow` | Orquestación del pipeline (schedule, reintentos, monitoreo) — instalado en `.venv_airflow/`, entorno separado |
 
 ---
 
 ## Outputs finales
 
-| Archivo | Nivel | Descripción |
+| Ubicación | Nivel | Descripción |
 |---|---|---|
-| `data/bronze/facebook_comments_raw.csv` | Comentario | Datos crudos de la API |
-| `data/silver/facebook_comments_clean.csv` | Comentario | Texto limpio y normalizado |
-| `data/silver/facebook_comments_embeddings.parquet` | Comentario | Embeddings BETO (768-dim) |
-| `data/gold/facebook_comments_classified.parquet` | Comentario | Predicciones binarias |
-| `data/gold/facebook_comments_probabilities.parquet` | Comentario | Probabilidades por etiqueta |
-| `data/gold/facebook_comments_gold_enriched.parquet` | Comentario | Predicciones + reglas de negocio |
-| `data/gold/facebook_post_metrics.parquet` | **Publicación** | Métricas agregadas + suavizado bayesiano + clasificación temática |
+| `gs://<BUCKET_NAME>/bronze/facebook_comments_raw.csv` | Comentario | Datos crudos de la API |
+| `dreammaker_silver.facebook_comments_clean` | Comentario | Texto limpio, normalizado y tipado |
+| `dreammaker_silver.facebook_comments_embeddings` | Comentario | Embeddings BETO (768-dim, `FLOAT64 REPEATED`) |
+| `dreammaker_gold.facebook_comments_classified` | Comentario | Predicciones binarias |
+| `dreammaker_gold.facebook_comments_probabilities` | Comentario | Probabilidades por etiqueta |
+| `dreammaker_gold.facebook_comments_gold_enriched` | Comentario | Predicciones + reglas de negocio |
+| `dreammaker_gold.facebook_post_metrics` | **Publicación** | Métricas agregadas + suavizado bayesiano + clasificación temática |
 
 ---
 
@@ -466,9 +505,9 @@ La versión inicial del proyecto (conservada en la rama [`legacy/v1`](../../tree
 
 **El problema que motivó el cambio:** el supuesto de exclusividad mutua no se sostenía en los datos reales. Un mismo comentario puede, al mismo tiempo, expresar interés comercial *y* ser políticamente cargado ("me encantaría comprarlo pero apoyar esto es una vergüenza"), o combinar una solicitud de información con fanatismo emocional sin intención de compra. Forzar una sola etiqueta por comentario obligaba al modelo a elegir una de esas dimensiones y descartar la otra, perdiendo información comercial válida en exactamente los casos más ambiguos y polarizados — que en este catálogo son frecuentes, no marginales.
 
-**La solución:** migrar a la arquitectura jerárquica multilabel descrita en la sección [Clasificación jerárquica](#4-clasificación-jerárquica--gold-comentarios) de este README: una Capa 1 que predice 8 etiquetas no excluyentes de forma independiente, y una Capa 2 que usa esas predicciones como contexto para detectar sarcasmo — permitiendo que un comentario sea, por ejemplo, simultáneamente `interes=1` y `conflictivo=1`, en vez de forzarlo a una sola categoría.
+**La solución:** migrar a la arquitectura jerárquica multilabel descrita en la sección [Clasificación jerárquica](#4-clasificación-jerárquica--gold-bigquery) de este README: una Capa 1 que predice 8 etiquetas no excluyentes de forma independiente, y una Capa 2 que usa esas predicciones como contexto para detectar sarcasmo — permitiendo que un comentario sea, por ejemplo, simultáneamente `interes=1` y `conflictivo=1`, en vez de forzarlo a una sola categoría.
 
-La rama `legacy/v1` se mantiene por trazabilidad histórica del proyecto, pero no recibe mantenimiento; el desarrollo activo ocurre sobre `main` y sus ramas de feature, como `feature/airflow-orchestration`.
+La rama `legacy/v1` se mantiene por trazabilidad histórica del proyecto, pero no recibe mantenimiento; el desarrollo activo ocurre sobre `main` y sus ramas de feature, como `feature/airflow-orchestration` y `feature/gcp-bigquery`.
 
 ---
 
@@ -485,6 +524,9 @@ Las publicaciones tienen volúmenes de comentarios muy dispares. Sin suavizado, 
 
 **¿Por qué el módulo de agregación recalcula siempre sobre el Gold completo?**
 Las proporciones globales usadas como prior bayesiano deben reflejar el estado real del dataset en cada ejecución. Si solo se recalculara sobre el delta, el prior estaría sesgado por la muestra más reciente y las métricas de todas las publicaciones cambiarían de forma incoherente entre ejecuciones.
+
+**¿Por qué los modelos entrenados ya no se versionan en git?**
+Git está pensado para versionar texto diffeable, no binarios de varios MB — cada `.pkl` subido queda para siempre en el historial, incluso si después se borra. Separar código (git) de artefactos de modelo (Cloud Storage, con versionado por carpeta si se quiere) es el patrón estándar de MLOps, y además evita que clonar el repo dependa de traer binarios pesados que no todos los que exploran el código necesitan.
 
 ---
 
