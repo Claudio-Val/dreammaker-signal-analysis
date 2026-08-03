@@ -6,21 +6,7 @@ Pipeline de análisis de lenguaje natural sobre comentarios de Facebook para **D
 
 El sistema extrae comentarios en español chileno desde la Facebook Graph API, los vectoriza con BETO (BERT en español), y los clasifica mediante un **clasificador jerárquico en dos capas** que detecta intenciones comerciales y sarcasmo condicionado. El resultado final es un dataset analítico a nivel publicación, enriquecido con métricas agregadas y variables temáticas, listo para consumo en herramientas de visualización como Power BI.
 
-> **Versionado:** esta rama (`feature/gcp-bigquery`) migra el almacenamiento del pipeline desde archivos locales a **Google Cloud**: Bronze pasa a vivir en Cloud Storage (CSV) y Silver/Gold pasan a BigQuery, manteniendo intacta la arquitectura Medallion y el clasificador jerárquico descritos en este README. Se construye sobre [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) (que añadió la orquestación con Apache Airflow), y ambas ramas conservan el mismo doble modo de ejecución local/Airflow. La versión puramente local, sin GCP, se mantiene en [`main`](../../tree/main). El clasificador multiclase de una sola etapa se conserva en [`legacy/v1`](../../tree/legacy/v1). En esta rama el pipeline **sigue corriendo en tu máquina** (`python pipeline.py` o Airflow standalone local) — lo único que cambia es dónde persisten los datos; la dockerización y el despliegue en una VM de GCP quedan para una rama futura. Ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud) para el detalle de esta migración.
-
----
-
-## Qué cambia en esta rama respecto a `feature/airflow-orchestration`
-
-| Aspecto | `feature/airflow-orchestration` | `feature/gcp-bigquery` (esta rama) |
-|---|---|---|
-| Bronze | CSV local (`data/bronze/`) | CSV en Cloud Storage (`gs://<BUCKET_NAME>/bronze/`) |
-| Silver | CSV + Parquet local (`data/silver/`) | Tablas de BigQuery, dataset `dreammaker_silver` |
-| Gold | Parquet local (`data/gold/`) | Tablas de BigQuery, dataset `dreammaker_gold` |
-| Modelos entrenados (`.pkl`) | Locales en `models/`, pensados para versionarse | Se descargan desde `gs://<BUCKET_NAME>/models/` en runtime; `models/` local queda solo como caché, ignorado por git |
-| Autenticación | No aplicaba | Application Default Credentials (ADC), vía `credentials/*.json` + `export GOOGLE_APPLICATION_CREDENTIALS` en la shell (ver [Configuración](#configuración)) |
-| Creación de infraestructura | No aplicaba | El pipeline crea las **tablas** automáticamente (idempotente); el bucket y los **datasets** de BigQuery se crean una vez, a mano |
-| Dónde corre | Local (`pipeline.py` o Airflow standalone) | Igual: local — la migración a VM/Docker queda para una rama futura |
+> **Versionado:** esta rama (`feature/gcp-bigquery`) migra el almacenamiento del pipeline desde archivos locales a **Google Cloud**: Bronze pasa a vivir en Cloud Storage (CSV) y Silver/Gold pasan a BigQuery, manteniendo intacta la arquitectura Medallion y el clasificador jerárquico descritos en este README. Se construye sobre [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) (que añadió la orquestación con Apache Airflow), y ambas ramas conservan el mismo doble modo de ejecución local/Airflow. La versión puramente local, sin GCP, se mantiene en [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration). El clasificador multiclase de una sola etapa se conserva en [`legacy/v1`](../../tree/legacy/v1). En esta rama el pipeline **sigue corriendo en tu máquina** (`python pipeline.py` o Airflow standalone local) — lo único que cambia es dónde persisten los datos; la dockerización y el despliegue en una VM de GCP quedan para una rama futura. Ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud) para el detalle de esta migración.
 
 ---
 
@@ -50,6 +36,20 @@ Desarrollar un sistema de clasificación basado en embeddings semánticos que id
 El objetivo final no es clasificar comentarios individuales, sino construir un **dataset analítico a nivel de publicación** donde cada post queda caracterizado mediante métricas agregadas, proporciones suavizadas y variables temáticas que permiten análisis exploratorio, segmentación y extracción de conocimiento comercial.
 
 Este dataset es la entrada principal del análisis en `02_commercial_signal_analysis.ipynb`.
+
+---
+
+## Qué cambia en esta rama respecto a `feature/airflow-orchestration`
+
+| Aspecto | `feature/airflow-orchestration` | `feature/gcp-bigquery` (esta rama) |
+|---|---|---|
+| Bronze | CSV local (`data/bronze/`) | CSV en Cloud Storage (`gs://<BUCKET_NAME>/bronze/`) |
+| Silver | CSV + Parquet local (`data/silver/`) | Tablas de BigQuery, dataset `dreammaker_silver` |
+| Gold | Parquet local (`data/gold/`) | Tablas de BigQuery, dataset `dreammaker_gold` |
+| Modelos entrenados (`.pkl`) | Locales en `models/`, pensados para versionarse | Se descargan desde `gs://<BUCKET_NAME>/models/` en runtime; `models/` local queda solo como caché, ignorado por git |
+| Autenticación | No aplicaba | Application Default Credentials (ADC), vía `credentials/*.json` + `export GOOGLE_APPLICATION_CREDENTIALS` en la shell (ver [Configuración](#configuración)) |
+| Creación de infraestructura | No aplicaba | El pipeline crea las **tablas** automáticamente (idempotente); el bucket y los **datasets** de BigQuery se crean una vez, a mano |
+| Dónde corre | Local (`pipeline.py` o Airflow standalone) | Igual: local — la migración a VM/Docker queda para una rama futura |
 
 ---
 
