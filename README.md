@@ -6,7 +6,13 @@ Pipeline de análisis de lenguaje natural sobre comentarios de Facebook para **D
 
 El sistema extrae comentarios en español chileno desde la Facebook Graph API, los vectoriza con BETO (BERT en español), y los clasifica mediante un **clasificador jerárquico en dos capas** que detecta intenciones comerciales y sarcasmo condicionado. El resultado final es un dataset analítico a nivel publicación, enriquecido con métricas agregadas y variables temáticas, listo para consumo en herramientas de visualización como Power BI.
 
+<<<<<<< HEAD
 > **Versionado:** esta rama (`feature/gcp-bigquery`) migra el almacenamiento del pipeline desde archivos locales a **Google Cloud**: Bronze pasa a vivir en Cloud Storage (CSV) y Silver/Gold pasan a BigQuery, manteniendo intacta la arquitectura Medallion y el clasificador jerárquico descritos en este README. Se construye sobre [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) (que añadió la orquestación con Apache Airflow), y ambas ramas conservan el mismo doble modo de ejecución local/Airflow. La versión puramente local, sin GCP, se mantiene en [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration). El clasificador multiclase de una sola etapa se conserva en [`legacy/v1`](../../tree/legacy/v1). En esta rama el pipeline **sigue corriendo en tu máquina** (`python pipeline.py` o Airflow standalone local) — lo único que cambia es dónde persisten los datos; la dockerización y el despliegue en una VM de GCP quedan para una rama futura. Ver [Almacenamiento en Google Cloud](#almacenamiento-en-google-cloud) para el detalle de esta migración.
+=======
+> **Versionado:** esta rama (`main`) contiene la arquitectura jerárquica multilabel descrita en este README, que corresponde a la versión estable del proyecto. La versión inicial del clasificador (modelo multiclase de una sola etapa) se conserva en la rama [`legacy/v1`](../../tree/legacy/v1) como referencia histórica. Ver la sección [Evolución del clasificador: de v1 a la arquitectura jerárquica](#evolución-del-clasificador-de-v1-a-la-arquitectura-jerárquica) para el detalle de esta migración.
+
+> La rama [`feature/airflow-orchestration`](../../tree/feature/airflow-orchestration) contiene la evolución del proyecto hacia una arquitectura MLOps, incorporando Apache Airflow para la orquestación del pipeline mediante DAGs, ejecución modular de tareas y compatibilidad entre ejecución local (`pipeline.py`) y ejecución orquestada.
+>>>>>>> origin
 
 ---
 
